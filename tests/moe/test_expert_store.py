@@ -198,6 +198,38 @@ def test_pin_subset_uses_the_usage_ranking(monkeypatch, tmp_path):
     assert source.pinned_bytes > 0
 
 
+def test_prefill_overlap_madvises_staged_layers(monkeypatch):
+    """The overlap prefill copy pageable-reads the mmap views; WILLNEED the bank first."""
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    class _Source:
+        resident = False
+
+        def __init__(self):
+            self.calls = []
+
+        def prefetch(self, layer, experts):
+            self.calls.append((layer, list(experts)))
+
+    gu = torch.arange(4 * 3 * 5, dtype=torch.float32).reshape(4, 3, 5)
+    dn = torch.arange(4 * 2 * 7, dtype=torch.float32).reshape(4, 2, 7) + 1000
+    source = _Source()
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=4, cache_size=8, device=torch.device("cpu"),
+        quant_format="bf16", prefill_overlap=True,
+    )
+    cache.set_bank_sources(
+        {"gate_up": [gu], "down": [dn]}, layer_residency=["mmap"], expert_source=source
+    )
+    cache.prefetch_prefill_layer(0)
+    assert source.calls == [(0, list(range(4)))]
+    assert torch.equal(cache.prefill_bank_buffers[0][0], gu)
+
+
 def test_mmap_residency_stages_decode_and_allows_prefill_overlap(monkeypatch):
     from freetoken.distributed import set_tp_info, try_get_tp_info
 
@@ -364,6 +396,20 @@ def test_staged_tier_counters_split_pinned_and_page(monkeypatch, tmp_path):
     assert cache.staged_tier_stats()["per_layer"][0]["pinned_rate"] == 0.5
 
 
+def test_finish_mmap_source_keeps_graphs_for_cpu_decode():
+    """D: pure-CPU decode over mmap is graph-capturable; staged GPU decode is not."""
+    from freetoken.engine.engine import _finish_mmap_source
+
+    cfg = SimpleNamespace(cuda_graph_max_bs=8, cuda_graph_bs=[1, 2, 4, 8], expert_usage_file=None)
+    _finish_mmap_source(cfg, SimpleNamespace(decode_target="cpu"))
+    assert cfg.cuda_graph_max_bs == 8
+    assert cfg.cuda_graph_bs == [1, 2, 4, 8]
+
+    _finish_mmap_source(cfg, SimpleNamespace(decode_target="gpu"))
+    assert cfg.cuda_graph_max_bs == 0
+    assert cfg.cuda_graph_bs == []
+
+
 def test_select_expert_source_auto_prefers_mmap_over_budget(monkeypatch, tmp_path):
     from freetoken.engine.engine import _select_expert_source
 
@@ -474,6 +520,54 @@ def test_select_expert_source_pinned_matches_the_fit(monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "8")
+    assert _select_expert_source(cfg, reserved=0) == "pinned"
+
+
+def test_select_expert_source_allows_mmap_for_cpu_decode(monkeypatch, tmp_path):
+    """D: --moe-strategy cpu over the mmap store (no pins, CPU executor reads the pages)."""
+    from freetoken.engine.engine import _select_expert_source
+
+    store = tmp_path / "store"
+    store.mkdir()
+    (store / "index.json").write_text('{"format": "freetoken_experts", "version": 1}')
+    model = tmp_path / "x.gguf"
+    model.write_bytes(b"")
+    cfg = SimpleNamespace(
+        expert_source="auto", expert_store=str(store), model_path=str(model),
+        moe_cpu_layers=None, moe_strategy="cpu",
+        model_config=SimpleNamespace(
+            num_moe_layers=1, num_experts=2, expert_quant="iq4_xs+iq4_nl",
+            moe_weight_format=None, hidden_size=64, moe_intermediate_size=32,
+        ),
+    )
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "0.000001")
+    assert _select_expert_source(cfg, reserved=0) == "mmap"
+
+    # explicit mmap is honored with a CPU strategy too
+    cfg.expert_source = "mmap"
+    assert _select_expert_source(cfg, reserved=0) == "mmap"
+
+    # no store: CPU decode falls back to the OS-locked (pinned-source) path instead of erroring
+    cfg.expert_source = "auto"
+    cfg.expert_store = None
+    assert _select_expert_source(cfg, reserved=0) == "pinned"
+
+
+def test_select_expert_source_cpu_layers_keeps_pinned(monkeypatch, tmp_path):
+    """Split residency needs mixed per-layer residency; auto keeps the pinned source there."""
+    from freetoken.engine.engine import _select_expert_source
+
+    store = tmp_path / "store"
+    store.mkdir()
+    (store / "index.json").write_text('{"format": "freetoken_experts", "version": 1}')
+    cfg = SimpleNamespace(
+        expert_source="auto", expert_store=str(store), model_path="x.gguf",
+        moe_cpu_layers="4", moe_strategy="offload",
+        model_config=SimpleNamespace(
+            num_moe_layers=8, num_experts=2, expert_quant="iq4_xs+iq4_nl",
+            moe_weight_format=None, hidden_size=64, moe_intermediate_size=32,
+        ),
+    )
     assert _select_expert_source(cfg, reserved=0) == "pinned"
 
 

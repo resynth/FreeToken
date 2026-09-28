@@ -31,7 +31,7 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
 | A | Read whole experts with large reads / `MADV_WILLNEED`, not per-page faults under `MADV_RANDOM` | High (20x cold) | S | Low |
 | B | Warm the page cache at startup (whole store, ~46 GiB of 62 fits in RAM) | High (first token/prefill) | S | Low |
 | C | Batched staged copy (double-buffered ring, one D2H sync, no per-chunk drain) (implemented) | Med-High | M | Med |
-| D | CPU/hybrid MoE reading the mmap store directly (no PCIe, no ring) | High (matches ik_llama.cpp) | M-L | Med |
+| D | CPU/hybrid MoE reading the mmap store directly (no PCIe, no ring) (implemented) | High (matches ik_llama.cpp) | M-L | Med |
 | E | Support composite `iq4_xs+iq4_nl` in the CPU MoE extension | High (prereq for D) | M | Low-Med |
 | F | Seed the warm/pin set from the REAP top-384 JSON (no calibration run needed) | Med-High | S-M | Med |
 | G | Run `ft experts stats` + `--expert-usage-file` (+ `--expert-pin-budget`) | Med | S to run / S to wire | Low |
@@ -93,8 +93,8 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
   default `<shard>.experts` path. Adding the CLI test
   (`tests/moe/test_expert_store.py`) caught a latent bug: it passed
   `SamplingParams(max_new_tokens=...)`, which is now mapped to `max_tokens`. Still open: the
-  offline pass runs eagerly (slow until D/E), and the live histogram is not wired to
-  `--moe-collect-stats`.
+  offline pass runs eagerly (it is much faster with D's CPU decode over the store), and the
+  live histogram is not wired to `--moe-collect-stats`.
 - **E - implemented.** The C++ `CpuMoeExecutor` now takes a per-role weight format
   (`weight_format` + `down_weight_format`), keeps two dot kernels (`q4dot_gu`/`q4dot_dn`)
   and per-role row strides (`q4_gu_row_bytes`/`q4_dn_row_bytes`), and checks H/I
@@ -112,6 +112,22 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
   with a rebuild instruction, and auto degrades to offload. Covered by
   `tests/moe/test_cpu_moe_gguf_quants.py` (CPU-vs-GPU
   equivalence on `iq4_xs+iq4_nl`, `iq4_nl+iq4_xs` and the singles).
+- **D - implemented.** `--moe-strategy cpu` (and hybrid) can now run the routed experts on the
+  CPU straight over the mmap store, so decode stops moving the working set over PCIe and
+  stops staging through the pinned ring. `_select_expert_source` no longer forces the pinned
+  source for a non-offload strategy or `--moe-cpu-layers`: `auto` picks the store when the
+  banks exceed the pin budget, and `--expert-source mmap` is honored for `cpu`/`hybrid`
+  (`engine.py`). A pure-CPU mmap boot also skips the `--moe-strategy cpu` OS-lock split
+  (there are no pins to size) and keeps CUDA graphs, because the CPU executor is
+  graph-capturable while staged H2D is not (`_finish_mmap_source` now only disables graphs
+  for `decode_target != "cpu"`). The cold-read floor is handled by a per-routed-expert
+  `MADV_WILLNEED`: `CpuMoeExecutor` detects a pageable (`expert_source.resident == False`)
+  source and enables `_cpu_moe.set_mmap_prefetch(True)`, so `submit()` madvises each routed
+  expert's whole gate_up/down byte range before the pool reads it (the topk ids are already
+  D2H'd by then), turning the 4 KiB fault stream into readahead. A stale `_cpu_moe.so`
+  without the setter falls back to the old per-page-fault path. Covered by
+  `tests/moe/test_cpu_moe_gguf_quants.py` (CPU-over-mmap vs GPU on the singles and
+  composites) and `tests/moe/test_expert_store.py` (source selection + graph policy).
 
 Local C A/B against the real store (`layer-000`, `gate_up`, cache_size 512, ring rows 8,
 `--legacy`, page-warm, 21 reps). Only the chunked cases move; a single-chunk layer is
@@ -177,7 +193,9 @@ sync count is far higher than needed.
 ### 4. CUDA graphs are disabled for the mmap source
 `_finish_mmap_source` sets `cuda_graph_max_bs = 0` (`engine/engine.py:1494-1497`). For a
 48-layer model that is a large constant Python/launch overhead on top of #3. It is disabled
-because the staged path runs host code that a captured graph would not replay.
+because the staged path runs host code that a captured graph would not replay. _(D changed
+this: the disable is now skipped for `decode_target == "cpu"`, where decode never stages -
+the CPU executor is graph-capturable; only hybrid/GPU staged decode stays eager.)_
 
 ### 5. GPU offload moves the working set over PCIe every token
 Even fully warm, the staged path copies every slot-cache miss host->device each token. On a
@@ -238,6 +256,7 @@ the two syncs are now one. Steps 1 and 4 are what the measured 1.4-1.6x on chunk
 comes from; the per-row Python fallback is only the no-`read_rows_into` path now.
 
 ### D. CPU/hybrid MoE reading the mmap store directly - Impact High, Effort M-L
+_(implemented, see Status)_
 The fastest thing on this machine is probably to compute MoE experts on the CPU from the
 mapped store, exactly as ik_llama.cpp does: no PCIe, no pinned host banks, no ring. This also
 sidesteps the pin budget entirely (the store lives in reclaimable page cache). Scope: the
@@ -252,11 +271,13 @@ Feasibility check against the code:
   whenever `moe_cpu_layers` is set or the strategy is not offload/hybrid
   (`engine/engine.py:1437-1438`), and `_cpu_moe_executor_viable` rejects the composite format
   (`engine/engine.py:1320-1322`).
-- Needed: allow the mmap source with `decode_target in ("cpu", "hybrid")`; set
-  `cpu_layer_ids` to all/selected layers; attach the executor; skip the GPU slot cache
-  allocation when nothing uses it. Add per-routed-expert `MADV_WILLNEED` prefetch (the
-  topk_ids are already D2H'd to pinned buffers in `decode_submit`) so cold CPU reads are
-  large, not 4 KiB faults (otherwise A is still required).
+- Implemented as: `_select_expert_source` allows mmap for cpu/hybrid (auto over budget, or
+  explicit), `decode_target == "cpu"` keeps CUDA graphs and skips the OS-lock split, and the
+  executor turns on C++ per-expert `MADV_WILLNEED`. The GPU slot cache is **not** skipped: the
+  prefill path still streams whole layers into it (for `--moe-strategy cpu` it is the fixed
+  2-layer prefill double buffer), so prefill still crosses PCIe - D removes the per-token
+  decode traffic, not the prefill stream. Prefill over the mmap store copies the mapped pages,
+  so keep `--expert-warm` (or a small pin) for it; the "F caveat" applies unchanged.
 - Expect a CPU-bound result: at H=2560, I=640, top-10 x 48 layers, the GEMV is ~2.4 GMAC/token;
   a 6P+8E AVX-VNNI core does this in the 10-30 tok/s class, and it removes the PCIe term.
   This is the most likely way to match ik_llama.cpp, but it is more work than A-C.
@@ -341,7 +362,9 @@ Guidance until the prefill path is made pin-aware or D/E removes the whole-layer
   `--expert-usage-file <usage.json> --expert-pin-fraction 0` (`select_pins` returns empty, but
   `_finish_mmap_source` still attaches the ranked one-layer prefetch).
 - Real fix: make the whole-layer prefill copy pinned rows from their pinned buffer and mmap
-  only the non-pinned remainder (a small `copy_missing` change), or D/E.
+  only the non-pinned remainder (a small `copy_missing` change). D/E removes the decode
+  dependence on the prefill stream but **not** prefill itself, which still copies the mapped
+  pages for every layer - so this caveat (and `--expert-warm`) still applies with a pin.
 
 ### G. Calibration usage file (`ft experts stats`) - Impact Med, Effort S to run
 _(implemented: store-flag forwarding + a latent `max_tokens` fix + a CLI test; see Status)_
@@ -429,12 +452,13 @@ whole-layer prefill path reads and makes serving much slower; on this 62 GiB hos
 Yes, probably the largest steady-state win here, because it removes the PCIe term (root cause
 5) and matches a RAM-resident working set. Work to unblock: E (composite in the CPU ext, ~1
 day, low risk because activations are already shared) + wiring the mmap source to the CPU
-executor (D) + bench-profile entries. **E and the bench-profile entries are done** (see
-Status); **D remains**: `--moe-strategy cpu` / `--moe-cpu-layers` still force the pinned
-source (`_select_expert_source`), so the CPU executor cannot yet read the mmap store
-directly. The CPU path does not require the banks to be pinned, so it also
-solves the "banks don't fit the pin budget" problem rather than working around it. It will not
-be fast if cold reads still fault per page, so A remains a prerequisite.
+executor (D) + bench-profile entries. **E, the bench-profile entries and D are done** (see
+Status): `--moe-strategy cpu` / `hybrid` with `--expert-source mmap` (or `auto` over the pin
+budget) runs the experts on the CPU reading the mapped store, and each routed expert is
+`MADV_WILLNEED`ed before its GEMV so cold reads do not fault per page. The CPU path needs no
+pinned banks, so it also solves the "banks don't fit the pin budget" problem rather than
+working around it - the page cache is the warm tier. Prefill still streams whole layers over
+PCIe, so `--expert-warm` (or a small pin) is still worth it.
 
 **Is the "gather all miss rows, one H2D, one index_copy_" fix worth it?**
 Yes - it is C, and it is the correct M2 implementation (the TODO in `docs/gguf.md:109-113`
@@ -480,7 +504,9 @@ surfaces:
 - `:109-113` staged decode is row-at-a-time and does two device syncs per layer -> fixed by C
   (one D2H sync + a double-buffered ring).
 - `:114-115` an auto-selected mmap source disables decode CUDA graphs with only an info log.
-  Raise that to a warning so a default boot that silently loses graphs is visible.
+  Raise that to a warning so a default boot that silently loses graphs is visible. D keeps
+  graphs for `--moe-strategy cpu` (no staged decode); the info log still covers the staged
+  (offload/hybrid) case.
 - `:123-125` the cold-path O_DIRECT option and `mincore` counters are benchmark-gated and the
   ring fill is currently a page-cache copy -> the A/B point in A.
 - `:126-129` the per-`(layer, expert)` histogram is not wired to `--moe-collect-stats` and has
@@ -504,9 +530,10 @@ surfaces:
    the A/B runs are reproducible). _C done; I and N remain._
 4. F (REAP-seeded warm set) or G (stats) - residency/prefetch. _F done
    (`--expert-warm-file`); G's store-flag forwarding + test done, the eager calibration run
-   remains slow until D/E._
+   is still eager (until it runs on cpu/hybrid over the store, which D now enables)._
 5. E + D (composite CPU ext, then CPU/hybrid over the mmap store) - the big architectural win.
-   _E done (plus bench-profile entries); D remains._
+   _E and D done (plus bench-profile entries): `--moe-strategy cpu`/`hybrid` reads the mmap
+   store directly with per-routed-expert prefetch. Prefill still streams whole layers._
 6. H, J, K as follow-ups.
 
 M (the `benchmarks/bench_expert_store.py` harness) is the measurement gate for all of the
@@ -564,14 +591,21 @@ See `docs/mmap-tiering-performance.md` for the full status and numbers.
 - **Pinning vs page cache (operational):** the whole-layer prefill path reads the mmap views,
   not the pinned buffers, so a large pin (44 GiB here) evicts the cache prefill needs and makes
   serving much slower - see the "F caveat" under Suggested fixes. Prefer `--expert-warm` with
-  no pin or a small `--expert-pin-fraction` until the prefill path is pin-aware or D/E lands.
+  no pin or a small `--expert-pin-fraction` until the prefill path is pin-aware; D/E removed
+  the decode dependence on this stream but prefill still copies the mapped pages.
 - **Composite CPU experts (E, done):** the CPU MoE extension takes a per-role weight format
   and keeps a dot kernel + row stride per role, so `iq4_xs+iq4_nl` (and any pair of
   native-GGUF W4A8 tags) computes on the CPU over the same packed banks, sharing the Q8_0/32
   activation quantization. `benchbw`/`bench_profile` carry the tags, so `--moe-strategy auto`
   can pick hybrid for them; `tests/moe/test_cpu_moe_gguf_quants.py` adds CPU-vs-GPU parity for
   the composite.
-- **Still open:** `--moe-strategy cpu`/hybrid over the mmap store is blocked on wiring the
-  mmap source to the CPU executor (D) - E is done, and D removes the PCIe term and is the big
-  architectural win.
+- **CPU/hybrid over the mmap store (D, done):** `--moe-strategy cpu` (and `hybrid`) can read
+  the mapped banks directly. `auto` picks the store when the banks exceed the pin budget and
+  `--expert-source mmap` is honored for a non-offload strategy; a pure-CPU mmap boot skips the
+  OS-lock split and keeps CUDA graphs (only staged GPU decode must run eagerly). The cold-read
+  floor is handled by `_cpu_moe.set_mmap_prefetch`, which `MADV_WILLNEED`s each routed
+  expert's gate_up/down range before the pool computes it. Prefill still streams whole layers
+  into the GPU slot cache, so keep `--expert-warm` (or a small pin); H (graph-capturable staged
+  decode), I (prefetch tuning), J (repack ordering), K (`cudaHostRegister`) and L (drop
+  `MADV_RANDOM`) remain as follow-ups.
 

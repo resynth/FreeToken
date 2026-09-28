@@ -634,8 +634,9 @@ class Engine:
             and config.moe_strategy in ("offload", "hybrid")
             and _explicit_pin_budget_bytes(self._host_tables_bytes) is not None
         )
-        if config.moe_strategy == "cpu" and not split_residency:
-            # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
+        if config.moe_strategy == "cpu" and not split_residency and expert_source_mode != "mmap":
+            # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead.
+            # The mmap source needs no bank pinning at all (page cache + optional warm subset), so it skips this split entirely.
             from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
             budget = _explicit_pin_budget_bytes(self._host_tables_bytes)
@@ -1439,7 +1440,10 @@ def _select_expert_source(config: EngineConfig, *, reserved: int, method=None) -
 
     "auto" keeps the pinned path while the banks fit the pin budget and falls back to a
     repacked mmap store when they do not (erroring with the repack command when no store
-    exists). "pinned" keeps the old pre-load budget check; "mmap" requires a store.
+    exists). "pinned" keeps the old pre-load budget check; "mmap" requires a store. The
+    mmap source is valid for GPU offload, hybrid and CPU decode (the CPU executor reads
+    the mapped banks directly); only a --moe-cpu-layers split residency needs pinned
+    banks, because it gives different layers different host residency.
     """
     from freetoken.moe.expert_store import is_expert_store
 
@@ -1454,8 +1458,10 @@ def _select_expert_source(config: EngineConfig, *, reserved: int, method=None) -
             )
             raise ValueError(f"--expert-source mmap needs an expert store at {store_dir!r}; {remedy}")
         return "mmap"
-    if config.moe_cpu_layers or config.moe_strategy not in ("offload", "hybrid"):
-        return "pinned"  # split residency / non-offload strategies keep the pinned path
+    if config.moe_cpu_layers:
+        # Split residency: the CPU layers are OS-locked and the rest pinned, which one
+        # source cannot express; the mmap store has no per-layer residency. Keep pinned.
+        return "pinned"
     if requested == "pinned":
         _check_pin_budget(config, reserved=reserved, method=method)
         return "pinned"
@@ -1468,6 +1474,16 @@ def _select_expert_source(config: EngineConfig, *, reserved: int, method=None) -
                 f"{budget / 2**30:.2f} GiB; serving from the mmap expert store {store_dir}"
             )
             return "mmap"
+        if config.moe_strategy == "cpu":
+            # Pure-CPU decode cannot fit the banks as pins, but it also does not need
+            # them pinned: the engine OS-locks the layers and the CPU executor reads
+            # them pageable. Only the GPU offload/hybrid paths require the store.
+            logger.info_rank0(
+                f"--moe-strategy cpu: banks {bank_bytes / 2**30:.2f} GiB exceed the pin "
+                "budget and no expert store is present; OS-locking all layers instead "
+                "(build one with `ft experts repack` for the mmap/page-cache tier)"
+            )
+            return "pinned"
         base = (
             f"expert banks need {bank_bytes / 2**30:.1f} GiB of pinned host RAM but the pin "
             f"budget is {budget / 2**30:.1f} GiB; "
@@ -1507,18 +1523,21 @@ def _resolve_expert_pin_budget(config: EngineConfig, *, reserved: int, method=No
 
 
 def _finish_mmap_source(config: EngineConfig, cache) -> None:
-    """Disable decode CUDA graphs and attach the usage-ranked prefetch plan.
+    """Disable decode CUDA graphs for the staged H2D path and attach the prefetch plan.
 
     The staged H2D path runs host code (ring fill + one num_indices/src_indices D2H sync)
     that a captured graph would execute only at capture time, so staged decode must run
-    eagerly.
+    eagerly. A pure-CPU decode (``--moe-strategy cpu``) never stages on decode -- the CPU
+    executor reads the mapped banks directly and is graph-capturable -- so graphs stay on
+    there and only the per-routed-expert mmap prefetch runs (inside the C++ executor).
     """
     from freetoken.moe.usage import load_usage, prefetch_plan
 
-    if config.cuda_graph_max_bs != 0:
-        logger.info_rank0("mmap expert source: disabling CUDA graphs (staged H2D is host-driven)")
-    object.__setattr__(config, "cuda_graph_bs", [])
-    object.__setattr__(config, "cuda_graph_max_bs", 0)
+    if cache.decode_target != "cpu":
+        if config.cuda_graph_max_bs != 0:
+            logger.info_rank0("mmap expert source: disabling CUDA graphs (staged H2D is host-driven)")
+        object.__setattr__(config, "cuda_graph_bs", [])
+        object.__setattr__(config, "cuda_graph_max_bs", 0)
     if config.expert_usage_file:
         usage = load_usage(config.expert_usage_file)
         if usage is not None:

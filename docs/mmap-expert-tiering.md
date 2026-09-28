@@ -95,6 +95,14 @@ Two implementations:
   `--expert-warm` plus `--ple-source` / `--ple-backend`, so a split qwen4exp GGUF can calibrate
   straight from its mmap store and external PLE table. Absent a usage
   file, fall back to LRU (the page cache and slot cache already approximate it).
+- **CPU/hybrid decode over the store (D)**: `--moe-strategy cpu` (and `hybrid`) reads the
+  mapped banks directly with the CPU executor - no pinned host banks, no staging ring, no
+  per-token PCIe. `auto` picks the store when the banks exceed the pin budget, and an
+  explicit `--expert-source mmap` is honored for these strategies; a split residency
+  (`--moe-cpu-layers`, which gives layers different host residency) still needs pinned banks.
+  The executor `MADV_WILLNEED`s each routed expert's range before its GEMV, so cold reads
+  become readahead rather than 4 KiB faults. Prefill still streams whole layers into the GPU
+  slot cache, so keep `--expert-warm` (or a small pin) for it.
 - **Retained-expert prior**: `--expert-warm-file` takes a JSON `layer -> [expert ids]` plan
   (e.g. a REAP top-K dump such as
   `docs/qwen3.8-flash-next-top-384-experts-according-to-sh0wie.json`) and pins exactly those
@@ -172,6 +180,11 @@ Two implementations:
    behaviour; tune against tok/s and hit rate.
 4. **M4 — polish.** Docs, bench-profile entries, `--expert-source pinned` error path, FTW
    compatibility (store can be written during `ft checkpoint`).
+5. **M5 — CPU/hybrid decode over the store (D).** `--moe-strategy cpu`/`hybrid` with the mmap
+   source: no pinned banks, no staging ring, no per-token PCIe, with a per-routed-expert
+   `MADV_WILLNEED` so cold reads readahead instead of faulting per page. _Done: composite CPU
+   experts (E) plus the source/engine wiring and the C++ prefetch; prefill still streams whole
+   layers, so `--expert-warm` (or a small pin) is still recommended._
 
 ## Risks
 
@@ -221,16 +234,29 @@ Verified on a 62 GiB / 16 GiB host with the 512-expert Qwen3.8-Flash-Next IQ4_XS
    ```
    A bare GGUF has no fp8 PLE table, so `--ple-source` is required (an HF repo id such as
    `Saren/Qwen3.8-Flash-Next-ple-table-fp8` also works, resolved through the HF cache).
+   To decode the experts on the CPU instead (D: no per-token PCIe, graphs stay capturable),
+   add `--moe-strategy cpu`:
+   ```
+   ft serve \
+     --model <model.gguf> --ple-source <fp8-ple-dir-or-repo-id> \
+     --moe-strategy cpu --expert-source mmap --expert-store <store> --expert-warm
+   ```
+   `--moe-strategy cpu` pins the slot cache to a two-layer prefill buffer, so
+   `--moe-cache-auto` no longer applies. `--moe-strategy hybrid` is the middle ground: the
+   GPU fetches a capped share of each decode step's misses over PCIe and the CPU computes the
+   rest from the store.
 
 Behaviour to expect:
 
-- **Staged decode runs eagerly**: the mmap source logs
-  `mmap expert source: disabling CUDA graphs (staged H2D is host-driven)`. This is v1's
-  correctness-first tradeoff; decode stays eager until D/E (or H). Pinning helps only the
-  staged decode path, not the whole-layer prefill (see the pin caveat below).
+- **Staged GPU decode runs eagerly**: with `--moe-strategy offload`/`hybrid` over the mmap
+  store, the source logs `mmap expert source: disabling CUDA graphs (staged H2D is
+  host-driven)`; that path stays eager until H. `--moe-strategy cpu` does not stage on decode
+  and keeps CUDA graphs (the CPU executor is graph-capturable). Pinning helps only the staged
+  decode path, not the whole-layer prefill (see the pin caveat below).
 - **Cold experts are read whole**: the staged ring fill (and the pinned-subset build) issues
   one buffered `preadv` per expert instead of faulting the mmap one 4 KiB page at a time
-  under `MADV_RANDOM`; the whole-layer prefill path `MADV_WILLNEED`s the bank first.
+  under `MADV_RANDOM`; the whole-layer prefill path `MADV_WILLNEED`s the bank first; and the
+  CPU executor `MADV_WILLNEED`s each routed expert before its GEMV (D).
 - **`--expert-warm`** sequentially reads the store once at startup, so the first token and
   prefill hit resident pages rather than cold ones. It logs the store size and achieved
   MiB/s; skip it when boot latency matters more than first-request latency.

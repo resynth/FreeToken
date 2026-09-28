@@ -36,9 +36,13 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #define CPU_MOE_HAS_AFFINITY 1
+#define CPU_MOE_HAS_MADVISE 1
 #else
 #define CPU_MOE_HAS_AFFINITY 0
+#define CPU_MOE_HAS_MADVISE 0
 #endif
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -1638,6 +1642,14 @@ struct CpuMoeExecutor {
   bool input_prequant = false;
   // Native-GGUF packed-row byte strides (gguf_row_bytes over K=H for gate_up, K=I for down).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
+  // Bytes of one whole expert in each role's bank (contiguous rows), for the mmap
+  // prefetch below.
+  size_t q4_gu_expert_bytes = 0, q4_dn_expert_bytes = 0;
+  // mmap expert source: the pageable banks fault one 4 KiB page at a time under
+  // MADV_RANDOM, so submit() MADV_WILLNEEDs each routed expert's byte range before the
+  // GEMV reads it (turning the fault stream into readahead). Left false for pinned
+  // banks, where it is a no-op. Set by the Python executor via set_mmap_prefetch.
+  bool prefetch_mmap = false;
   float e2m1_lut[16];
   float e4m3_lut[256];
   float e8m0_lut[256];         // mxfp4 block scale: 2^(s-127), s clamped to [0,254]
@@ -1770,6 +1782,8 @@ struct CpuMoeExecutor {
             "GGUF 4-bit CPU MoE requires H and I to be multiples of their role's block size");
       q4_gu_row_bytes = gguf_row_bytes(fmt, H);  // K = H (gate_up rows)
       q4_dn_row_bytes = gguf_row_bytes(dn_fmt, I);  // K = I (down rows)
+      q4_gu_expert_bytes = static_cast<size_t>(2 * I) * static_cast<size_t>(q4_gu_row_bytes);
+      q4_dn_expert_bytes = static_cast<size_t>(H) * static_cast<size_t>(q4_dn_row_bytes);
     }
     isa = c.name;
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. The native-GGUF
@@ -2280,7 +2294,44 @@ struct CpuMoeExecutor {
     }
   }
 
+  // mmap source: MADV_WILLNEED each routed expert's contiguous byte range in both role
+  // banks before the pool reads them. A no-op for pinned banks and for non-GGUF formats
+  // (only the native-GGUF store is pageable). Failures are ignored: madvise is a hint.
+  void set_mmap_prefetch(bool on) { prefetch_mmap = on; }
+
+#if CPU_MOE_HAS_MADVISE
+  static void madvise_range(const uint8_t* base, size_t off, size_t len, size_t mask) {
+    if (base == nullptr || len == 0) return;
+    const uintptr_t start =
+        reinterpret_cast<uintptr_t>(base + off) & ~static_cast<uintptr_t>(mask);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(base + off) + len;
+    const size_t rounded = static_cast<size_t>((end - start + mask) & ~mask);
+    ::madvise(reinterpret_cast<void*>(start), rounded, MADV_WILLNEED);
+  }
+
+  void prefetch_task_experts(const MoeTask* t) {
+    if (!prefetch_mmap || !use_q4a8) return;
+    const uint8_t* gu = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
+    const uint8_t* dn = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
+    if ((gu == nullptr || q4_gu_expert_bytes == 0) &&
+        (dn == nullptr || q4_dn_expert_bytes == 0))
+      return;
+    const long page = sysconf(_SC_PAGESIZE);
+    const size_t mask = (page > 0 ? static_cast<size_t>(page) : 4096) - 1;
+    const int n = t->num_tokens * top_k;
+    for (int i = 0; i < n; ++i) {
+      const int e = t->ids[i];
+      if (e < 0 || e >= num_experts) continue;
+      madvise_range(gu, static_cast<size_t>(e) * q4_gu_expert_bytes, q4_gu_expert_bytes, mask);
+      madvise_range(dn, static_cast<size_t>(e) * q4_dn_expert_bytes, q4_dn_expert_bytes, mask);
+    }
+  }
+#else
+  void prefetch_task_experts(const MoeTask*) {}
+#endif
+
   void submit(MoeTask* t) {
+    prefetch_task_experts(t);
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
@@ -2535,6 +2586,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("pin_core"))
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
+           py::arg("value"))
+      .def("set_mmap_prefetch",
+           [](CpuMoeExecutor& e, bool v) { e.set_mmap_prefetch(v); },
            py::arg("value"))
       .def("isa_name", &CpuMoeExecutor::isa_name);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));

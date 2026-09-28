@@ -311,6 +311,25 @@ class CpuMoeExecutor:
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
 
+        # The mmap expert source hands the executor pageable bank pointers: a cold page
+        # would fault one 4 KiB at a time (the source maps with MADV_RANDOM). Ask the
+        # extension to MADV_WILLNEED each routed expert's range before the GEMV, so the
+        # read becomes readahead-backed. Pinned banks are already resident (no-op).
+        source = getattr(cache, "expert_source", None)
+        self.mmap_prefetch = bool(
+            source is not None and not getattr(source, "resident", True)
+        )
+        if self.mmap_prefetch:
+            enable = getattr(self._ext, "set_mmap_prefetch", None)
+            if enable is not None:
+                enable(True)
+                logger.info_rank0(
+                    "CPU MoE executor: mmap expert source -> MADV_WILLNEED prefetch of "
+                    "each routed expert before its GEMV"
+                )
+            else:
+                self.mmap_prefetch = False  # stale .so: fall back to per-page faults
+
         spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
         if clamp < torch.get_num_threads():

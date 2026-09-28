@@ -821,6 +821,11 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
+            if self.expert_source is not None and layer_id in self._staged_layers:
+                # mmap layer: MADV_WILLNEED the whole bank before the pageable H2D copy, so
+                # the kernel reads ahead instead of faulting one 4 KiB page at a time under
+                # MADV_RANDOM (same as the non-overlap materialize branch in copy_missing).
+                self.expert_source.prefetch(layer_id, range(self.num_experts))
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
                 buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
 

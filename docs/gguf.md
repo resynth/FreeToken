@@ -99,9 +99,13 @@ ft experts repack <gguf> --out <store> --drop-ple
 ft serve --model <gguf> --ple-source Saren/Qwen3.8-Flash-Next-ple-table-fp8 \
     --expert-source mmap --expert-store <store> --moe-cache-auto --expert-warm
 ```
-See [mmap-expert-tiering.md](mmap-expert-tiering.md) "Running with the store": staged decode
-is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs. `--expert-warm`
-pre-loads the store into the page cache, which is the warm tier the whole-layer prefill reads.
+See [mmap-expert-tiering.md](mmap-expert-tiering.md) "Running with the store": staged GPU
+decode is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs. For
+this model CPU decode over the store is usually the fastest option (D): add
+`--moe-strategy cpu` and drop `--moe-cache-auto` (CPU mode fixes the slot cache to a two-layer
+prefill buffer); it keeps CUDA graphs and skips the per-token PCIe copy, with the CPU executor
+prefetching each routed expert. Prefill still streams whole layers, so `--expert-warm`
+pre-loads the store into the page cache the whole-layer prefill reads.
 
 Pinning is optional and, on this host, a large pin hurts: `--expert-warm-file` pins the
 REAP-retained 384/layer (45.7 GiB) and `--expert-usage-file` (from `ft experts stats`) pins a
@@ -158,7 +162,10 @@ pin with `--expert-pin-fraction`; to calibrate, run `ft experts stats --model <g
     static retained set, no ranking and no prefetch).
   - The mmap store is native-GGUF only (`q4_0`/`q5_K`/`iq4_nl`/`iq4_xs` and composite tags)
     and requires contiguous expert layers; nvfp4/mxfp4/fp8-block and HF/FTW checkpoints keep
-    the pinned path, and leading-dense expert layouts are rejected by the repack.
+    the pinned path, and leading-dense expert layouts are rejected by the repack. Both GPU
+    offload/hybrid and CPU decode can read it (`--moe-strategy cpu`/`hybrid` +
+    `--expert-source mmap`): the CPU executor points its W4A8 GEMV straight at the mapped
+    banks and prefetches each routed expert (D, see `mmap-tiering-performance.md`).
   - `ft checkpoint` does not emit an expert store, and the engine checks the store's
     format/geometry but not its `fingerprint`/`source_path`, so a same-geometry store built
     from a different checkpoint is accepted silently.
@@ -168,7 +175,8 @@ pin with `--expert-pin-fraction`; to calibrate, run `ft experts stats --model <g
   `--ple-source` / `--ple-backend` to the calibration model (a split GGUF's store is not at
   the default `<shard>.experts` path, and qwen4exp needs its external fp8 PLE table), and its
   `--max-new-tokens` is mapped to `SamplingParams.max_tokens` (it previously raised a
-  TypeError). It still runs the full model eagerly, so it is slow until D/E; its CLI-level
+  TypeError). It still runs the full model eagerly, so it is slow (use `--moe-strategy cpu`
+  over the store, D, to speed it up); its CLI-level
   test coverage is now in `tests/moe/test_expert_store.py`.
 
   - Online adaptive re-pinning (calibration/production drift detection) stays out of scope
