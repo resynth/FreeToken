@@ -59,7 +59,11 @@ Two implementations:
 `OffloadMoeCache` currently copies full/partial layers from pinned banks with a fused
 `cudaMemcpyAsync` batch. For the mmap source:
 - Stage through a small **pinned ring** and `cudaMemcpyAsync` into the slot cache. Copying
-  straight from pageable mmap also works but is ~2x slower; the ring hides that.
+  straight from pageable mmap also works but is ~2x slower; the ring hides that. The ring is
+  **double-buffered** (one buffer fills on the host while the other's pinned->CUDA copy is in
+  flight, per-buffer events guarding reuse), and the layer's `num_indices` + `src_indices` are
+  read with **one** D2H sync, so there is no per-chunk stream drain. See
+  `mmap-tiering-performance.md` C for the measured 1.4-1.6x on chunked layers.
 - **The ring must be filled through the page cache, not around it.** O_DIRECT reads bypass
   the page cache, so filling the ring that way would leave the warm tier unused and make
   `MADV_WILLNEED` prefetch pointless. The ring fill reads each whole expert with one
@@ -101,6 +105,10 @@ Two implementations:
 - `--expert-warm` (`FREETOKEN_EXPERT_WARM=1`): sequentially read the whole store once at
   startup so the page cache is warm before the first request, instead of faulting experts
   in on demand. Opt-in because it is a one-off whole-store read (~15 s for 62 GiB here).
+- `FREETOKEN_EXPERT_RING_ROWS` (default 8) sizes one staging buffer; the ring is
+  double-buffered, so the pinned carve-out is `2 * rows * expert_bytes`. Still env-only; the
+  default measured fastest in `benchmarks/bench_expert_store.py`, so change it only with that
+  bench's numbers.
 - `--expert-store <dir>` (default: alongside the checkpoint, or a cache dir).
 - `_check_pin_budget` no longer errors for offload; it selects the mmap source instead
   (keeping the error only for `--expert-source pinned`, and for models with no store).
@@ -141,6 +149,9 @@ Two implementations:
    in both regimes — cold first read, and repeat reads of the same expert (the mmap copy
    leaves pages resident; an O_DIRECT read never does) — before committing to a default;
    they win in opposite regimes, so a single-axis benchmark picks the wrong default.
+   _Status: whole-expert buffered perad (A), the batched double-buffered ring (C) and the
+   `benchmarks/bench_expert_store.py` harness (M) are done; O_DIRECT remains a benchmarked
+   option, not a default. Usage-ranked `MADV_WILLNEED` prefetch (I) is unchanged._
 3. **M3 — usage/pin policy.** Per-expert stats, usage file, pinned warm subset, auto-reap
    behaviour; tune against tok/s and hit rate.
 4. **M4 — polish.** Docs, bench-profile entries, `--expert-source pinned` error path, FTW

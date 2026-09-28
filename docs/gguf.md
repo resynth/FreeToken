@@ -106,17 +106,18 @@ is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs, 
 - Offload pins the whole expert set by default; the disk-backed mmap tier
   (`ft experts repack` + `--expert-source mmap`, see `mmap-expert-tiering.md`) now serves
   sets that exceed the pin budget. Deferred follow-ups from the v1 review:
-  - Staged decode copies miss rows one at a time in a Python loop
-    (`offload_cache.py:_copy_missing_staged`). Reads are now whole-expert buffered `preadv`
-    through `ExpertSource.read_rows_into` (not per-page mmap faults), but the loop still
-    does one H2D + `index_copy_` per ring chunk; batch it once the source grows a
-    `warm_rows` gather.
-  - Each staged layer does two device syncs per step (`num_indices.item()` and
-    `src_indices.cpu()`), including the all-hit case; read both from one pinned host buffer.
+  - Staged decode now fills a double-buffered pinned ring with whole-expert buffered
+    `preadv` rows (`ExpertSource.read_rows_into`, no per-page mmap faults) and reads
+    `num_indices`/`src_indices` with one D2H sync, with no per-chunk stream drain
+    (`offload_cache.py:_copy_missing_staged`). The per-row Python loop survives only as the
+    fallback for a source without `read_rows_into`. Read-path and copy A/B numbers:
+    `benchmarks/bench_expert_store.py` (see `mmap-tiering-performance.md` C/M).
   - An auto-selected mmap source disables decode CUDA graphs with only an info log
     (`engine._finish_mmap_source`); warn explicitly when `--expert-source auto` picks mmap.
-  - `FREETOKEN_EXPERT_RING_ROWS` default is duplicated in `engine._resolve_expert_pin_budget`
-    and `OffloadMoeCache.__post_init__`, so the budget and the allocated ring can drift.
+  - `FREETOKEN_EXPERT_RING_ROWS` is read once (`offload_cache.staging_ring_rows()`), and
+    `_resolve_expert_pin_budget` carves out both staging buffers, so the budget and the
+    allocated ring can no longer drift. Still env-only with no CLI flag, and the default 8
+    measured fastest in the bench; change it only with that bench's numbers.
   - The repack writer's GGUF tensor-name -> role mapping duplicates
     `moe/gguf_experts.py:load_gguf_expert_sources`; a new naming or fused form must be
     updated in both.
@@ -125,7 +126,9 @@ is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs, 
   - The cold-path O_DIRECT option and `mincore`-based cold-read counters from the plan are
     not implemented; ring fill is a buffered whole-expert page-cache read
     (`ExpertSource.read_rows_into`). Both are benchmark-gated in the plan, not committed
-    behaviour. Startup page-cache warming is `--expert-warm` / `FREETOKEN_EXPERT_WARM=1`.
+    behaviour; `benchmarks/bench_expert_store.py` now measures the read paths (`o_direct`
+    among them) so a default can be picked with numbers. Startup page-cache warming is
+    `--expert-warm` / `FREETOKEN_EXPERT_WARM=1`.
   - Online per-`(layer, expert)` counters are not wired to `--moe-collect-stats`: the server
     path only accumulates `lru_stats` (miss rate), while the histogram needs
     `collect_decode_freq` set programmatically and has no dump endpoint, so

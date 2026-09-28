@@ -30,7 +30,7 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
 |---|---|---|---|---|
 | A | Read whole experts with large reads / `MADV_WILLNEED`, not per-page faults under `MADV_RANDOM` | High (20x cold) | S | Low |
 | B | Warm the page cache at startup (whole store, ~46 GiB of 62 fits in RAM) | High (first token/prefill) | S | Low |
-| C | Batched staged copy (M2 proper): one gather + one H2D + one scatter, no per-chunk sync | Med-High | M | Med |
+| C | Batched staged copy (double-buffered ring, one D2H sync, no per-chunk drain) (implemented) | Med-High | M | Med |
 | D | CPU/hybrid MoE reading the mmap store directly (no PCIe, no ring) | High (matches ik_llama.cpp) | M-L | Med |
 | E | Support composite `iq4_xs+iq4_nl` in the CPU MoE extension | High (prereq for D) | M | Low-Med |
 | F | Seed the warm/pin set from the REAP top-384 JSON (no calibration run needed) | Med-High | S-M | Med |
@@ -40,7 +40,7 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
 | J | Usage-ordered repack (hot experts contiguous per layer) | Med | M | Low |
 | K | `cudaHostRegister` the warm mmap ranges instead of copying to anonymous pinned | Med | L | High |
 | L | Remove the default `MADV_RANDOM` (or make it policy) | Med (moot with A) | S | Low |
-| M | Add a microbenchmark harness so ring/size/usage changes get real A/B numbers | Enables all | S-M | None |
+| M | Add a microbenchmark harness so ring/size/usage changes get real A/B numbers (implemented) | Enables all | S-M | None |
 | N | Surface the `FREETOKEN_EXPERT_*` knobs as flags and warn (not info) when `auto` picks mmap | Low | S | None |
 
 `Impact` is on this model's slowness, `Effort` is S (< half day), M (1-2 days), L (3+ days).
@@ -58,6 +58,38 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
   `MmapExpertSource.warm_cache()` at load: bounded multi-threaded buffered sequential reads of
   every bank range, before the pinned subset is built. Wired through
   `moe/expert_banks.py`, `engine/config.py` and `server/args.py`.
+- **C - implemented.** `_copy_missing_staged` (`moe/offload_cache.py`) now learns
+  `num_indices` + `src_indices` with **one** D2H sync (pinned mirrors of both, copied
+  together) instead of two, and stages a layer's misses through a **double-buffered** pinned
+  ring with per-buffer CUDA events, so the previous chunk's pinned->CUDA copy is still in
+  flight while the host fills the other buffer. The per-chunk full-stream `synchronize` is
+  gone; the ring fill still calls `ExpertSource.read_rows_into` (one buffered whole-expert
+  pread per miss). The old `FREETOKEN_EXPERT_RING_ROWS` read is now shared
+  (`offload_cache.staging_ring_rows()` / `STAGING_RING_BUFFERS`) so the pin-budget carve-out
+  and the allocated ring cannot drift.
+- **M - implemented.** `benchmarks/bench_expert_store.py` microbenchmarks, without a model
+  load:
+  - the store read paths (`mmap_random`, `willneed`, `pread_whole`, `o_direct`) cold/warm,
+    as MiB/s and ms/expert;
+  - `_copy_missing_staged` swept over ring rows x miss count, with `--legacy` timing the
+    pre-C loop for a direct A/B;
+  - a per-token / per-1000-token-prefill projection from the measured whole-expert reads.
+  It synthesizes a tiny store when `--store` is omitted, so it runs anywhere.
+
+Local C A/B against the real store (`layer-000`, `gate_up`, cache_size 512, ring rows 8,
+`--legacy`, page-warm, 21 reps). Only the chunked cases move; a single-chunk layer is
+unchanged by construction:
+
+| misses | chunks (ring 8) | new ms | legacy ms | speedup |
+|---|---|---|---|---|
+| 8 | 1 | 3.60 | 3.53 | 0.98x |
+| 32 | 4 | 11.44 | 16.25 | 1.42x |
+| 128 | 16 | 42.53 | 67.00 | 1.58x |
+
+Ring scaling with 128 misses (new code): ring 8 **42.2 ms**, ring 32 43.7 ms, ring 128
+55.4 ms. The double buffer makes the default ring of 8 the best of the three; do not raise
+`FREETOKEN_EXPERT_RING_ROWS` without re-running the bench (a one-chunk ring loses the
+fill/copy overlap and the smaller PCIe batches pipeline better here).
 
 Local A/B against the real store (`layer-000.gate_up`, 32 random experts x 1.66 MiB, page
 cache dropped between runs). This box cannot be made fully cold, so it understates the
@@ -70,8 +102,8 @@ table's 53 MiB/s cold baseline:
 
 The cold read is ~2.1x faster here (the 20x is the truly-cold O_DIRECT gap from the table
 above). The warm read is ~2x slower than the mmap memcpy but stays >6 GiB/s, well clear of the
-cold floor, and with B the steady state is warm. C (one batched gather + one H2D/sync per
-layer) is the next step and is unchanged by this work.
+cold floor, and with B the steady state is warm. C (the double-buffered ring, one D2H sync)
+followed; `benchmarks/bench_expert_store.py` reproduces all of these numbers.
 
 ## Root causes (with references)
 
@@ -92,6 +124,7 @@ relies on the page cache, which is never pre-warmed: it fills 4 KiB at a time on
 There is no "warm the store once at boot" step anywhere.
 
 ### 3. Host-synchronized, row-at-a-time staged copy
+_(fixed: C, see Status; the analysis below is the pre-C baseline)_
 `_copy_missing_staged` (`moe/offload_cache.py:1185-1222`) does, per MoE layer, per bank:
 - `int(self.num_indices.item())` - a device sync (`:1193`),
 - `self.src_indices[:n].cpu().tolist()` - a second device sync (`:1198`),
@@ -145,6 +178,7 @@ page cache; at the measured 4.2 GiB/s that is ~11 s of boot for a mostly-warm se
 the way pinning does.
 
 ### C. Batch the staged copy properly (the real M2 ring) - Impact Med-High, Effort M
+_(implemented, see Status)_
 This is the exact follow-up already recorded in `docs/gguf.md:109-113` ("staged decode copies
 miss rows one at a time ... instead of a batched gather"; "each staged layer does two device
 syncs ... read both from one pinned host buffer"), so it is the intended next step.
@@ -159,6 +193,12 @@ Replace the per-expert Python loop + per-chunk sync with:
 
 Also worth doing while here: skip the two syncs entirely on the all-hit case by deferring the
 `num_indices` read (currently `num_indices.item()` happens before the early-out).
+
+Implemented as: (1) a single pinned D2H of both plus one `synchronize`; (2) `read_rows_into`
+per chunk; (3)+(4) a double-buffered ring with per-buffer events and no stream drain. The
+all-hit case still pays one D2H (the device owns the count and the staged path is eager), but
+the two syncs are now one. Steps 1 and 4 are what the measured 1.4-1.6x on chunked layers
+comes from; the per-row Python fallback is only the no-`read_rows_into` path now.
 
 ### D. CPU/hybrid MoE reading the mmap store directly - Impact High, Effort M-L
 The fastest thing on this machine is probably to compute MoE experts on the CPU from the
@@ -267,6 +307,7 @@ policy only hurts. Make it `MADV_NORMAL` by default, or apply `MADV_RANDOM` only
 view used for sparse pinned-subset copies.
 
 ### M. Add a microbenchmark harness - Effort S-M
+_(implemented: `benchmarks/bench_expert_store.py`, see Status)_
 Do not try to A/B via the server until A/B are fixed: it is too slow and noisy to isolate
 anything. Add `benchmarks/` entries that, without loading the model,
 1. cold-read N experts from a store via each path (mmap+MADV_RANDOM, WILLNEED, large pread) and
@@ -297,16 +338,20 @@ be fast if cold reads still fault per page, so A remains a prerequisite.
 **Is the "gather all miss rows, one H2D, one index_copy_" fix worth it?**
 Yes - it is C, and it is the correct M2 implementation (the TODO in `docs/gguf.md:109-113`
 says the same). It removes the per-row Python loop and the per-chunk sync, and cuts the
-per-layer host reads from two to one. But note it is a *latency/CPU* fix: it does not change
-the 53 MiB/s cold-read floor. Do A first so C's gains are visible.
+per-layer host reads from two to one. Measured on the real store at ring 8 (Status, C): 1.0x
+at 8 misses (one chunk, so nothing to overlap), 1.4x at 32, 1.6x at 128. But note it is a
+*latency/CPU* fix: it does not change the 53 MiB/s cold-read floor. Do A first so C's gains
+are visible.
 
 **`FREETOKEN_EXPERT_RING_ROWS=64` did nothing - how to measure properly?**
 Because at ~10 misses/layer the default ring of 8 already needs only 1-2 chunks, the per-chunk
 sync was not the dominant term; the dominant term was cold reads (#1) and the two per-layer
-syncs (#3). Measure with M: a standalone `_copy_missing_staged` bench with cold/warm cache and
-ring 8/32/512, plus a fixed short prompt through the server capturing TTFT and
-`staged_tier_stats`. If the model is too slow to reach steady state, use `--max-new-tokens 1`
-and time TTFT only; that isolates cold-read cost.
+syncs (#3). Use M's `benchmarks/bench_expert_store.py --section staged --legacy`: it sweeps
+ring rows x miss count and times the pre-C loop against the new one directly. On the real
+store the new code at ring 8 was the fastest of 8/32/128 for 128 misses (Status, C), so the
+default is already the right size; re-run the bench after changing it. To isolate cold reads
+rather than the copy, use the read section with `--cold`, and a fixed short prompt through
+the server capturing TTFT and `staged_tier_stats`.
 
 **Does the usage file + pin budget route help?** Yes, it improves hit rate and enables
 next-layer prefetch, but it improves *overlap*, not raw cold volume. Combine with A/B.
@@ -315,11 +360,13 @@ next-layer prefetch, but it improves *overlap*, not raw cold volume. Combine wit
 
 - The store's `index.json` `fingerprint` is not checked against the model at load
   (`docs/gguf.md:133-135`); if you rebuild/move the store, verify format/geometry manually.
-- `_resolve_expert_pin_budget` and `OffloadMoeCache.__post_init__` read
-  `FREETOKEN_EXPERT_RING_ROWS` independently (both default 8); if you change the ring size,
-  the budget carve-out can drift (`docs/gguf.md:116-117`).
-- The ring is allocated per bank as `staging_rows * row_shape`; a large ring is real pinned
-  RAM (`--expert-pin-budget` already carves it out) - size it deliberately.
+- `FREETOKEN_EXPERT_RING_ROWS` is now read in one place
+  (`offload_cache.staging_ring_rows()`) and `_resolve_expert_pin_budget` carves out
+  `STAGING_RING_BUFFERS` (2) buffers, so the budget carve-out and the allocated ring cannot
+  drift (`docs/gguf.md:116-117`). Changing the ring size still requires re-running M.
+- The ring is allocated per bank as `2 * staging_rows * row_shape` (double-buffered); a large
+  ring is real pinned RAM (`--expert-pin-budget` already carves it out) - size it deliberately,
+  and note the bench showed the default 8 beating 32/128 for 128 misses.
 - `MADV_WILLNEED` is async; issuing it immediately before the copy may not win much, but it
   does switch the kernel from 4 KiB faults to readahead. For a hard guarantee, do the large
   `pread` into the ring (A).
@@ -329,7 +376,8 @@ next-layer prefetch, but it improves *overlap*, not raw cold volume. Combine wit
 `docs/gguf.md:104-166` already tracks most of this; the mapping, plus the few extras it
 surfaces:
 
-- `:109-113` staged decode is row-at-a-time and does two device syncs per layer -> fix C.
+- `:109-113` staged decode is row-at-a-time and does two device syncs per layer -> fixed by C
+  (one D2H sync + a double-buffered ring).
 - `:114-115` an auto-selected mmap source disables decode CUDA graphs with only an info log.
   Raise that to a warning so a default boot that silently loses graphs is visible.
 - `:123-125` the cold-path O_DIRECT option and `mincore` counters are benchmark-gated and the
@@ -351,10 +399,13 @@ surfaces:
    _A done; L left as follow-up (moot for the fixed paths)._
 2. B (startup page-cache warm) - first token and prefill. _Done._
 3. C (batched staged copy, one sync/layer) + I (current-layer prefetch) + N (flags/warning so
-   the A/B runs are reproducible).
+   the A/B runs are reproducible). _C done; I and N remain._
 4. F (REAP-seeded warm set) or G (stats) - residency/prefetch.
 5. E + D (composite CPU ext, then CPU/hybrid over the mmap store) - the big architectural win.
 6. H, J, K as follow-ups.
+
+M (the `benchmarks/bench_expert_store.py` harness) is the measurement gate for all of the
+above; run it before and after any ring/source policy change.
 
 ## Appendix: how the evidence was gathered
 
@@ -369,3 +420,34 @@ Benchmarks are plain `os.preadv`/`mmap` reads against
 Note the cold numbers are O_DIRECT (cache bypassing), which is the right lower bound for a
 page-cache miss; `MADV_RANDOM` page faults were not measured directly because the store was
 already mostly resident in page cache on this box during testing.
+
+This is now reproducible without a model load via
+`benchmarks/bench_expert_store.py --store /media/b/Hyena/qwen38-experts-store --section read
+--cold`. Its `o_direct` column matches the 256 KiB row above (~1.3 GiB/s, ~1.22 ms/expert) and
+its `pread_whole` column the buffered whole-expert row. Its `--cold` is best-effort
+(`madvise(MADV_DONTNEED)` on the mapping + `fadvise(DONTNEED)`); without root the page cache is
+rarely fully evicted, so the faulting paths read faster than the true 53 MiB/s cold lower bound
+- trust the O_DIRECT column for the honest cold number. The `--section staged --legacy` mode
+produces the C A/B numbers in Status directly against the cache.
+
+
+## Update: implemented since these notes
+
+See `docs/mmap-tiering-performance.md` for the full status and numbers.
+
+- **A+B (done):** whole-expert buffered `preadv` reads (`ExpertSource.read_rows_into`) on the
+  staged/pin paths, and `--expert-warm` / `FREETOKEN_EXPERT_WARM=1` page-cache warm-up.
+- **The staged-copy fix above (C, done):** `_copy_missing_staged` now reads `num_indices` +
+  `src_indices` with one D2H sync and stages through a double-buffered pinned ring with
+  per-buffer events, with no per-chunk stream drain. Measured on the real store, ring 8:
+  1.0x at 8 misses, 1.4x at 32, 1.6x at 128. The per-row Python loop is now only the
+  fallback for a source without `read_rows_into`.
+- **Measure properly (M, done):** `benchmarks/bench_expert_store.py` needs no model load.
+  `--section read --cold` measures cold/warm read paths and `--section staged --legacy`
+  times the old staged loop vs the new one, so ring/size/usage changes get A/B numbers
+  without the server. On the real store the default ring of 8 measured fastest (do not
+  raise `FREETOKEN_EXPERT_RING_ROWS` without re-running it).
+- **Still open:** `--moe-strategy cpu`/hybrid is blocked on composite `iq4_xs+iq4_nl`
+  support in the CPU MoE extension (E) plus wiring the mmap source to the CPU executor (D);
+  that removes the PCIe term and is the big architectural win.
+

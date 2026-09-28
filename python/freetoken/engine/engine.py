@@ -15,7 +15,11 @@ from freetoken.distributed import destroy_distributed, enable_pynccl_distributed
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
-from freetoken.moe.offload_cache import iter_offload_moe_layers
+from freetoken.moe.offload_cache import (
+    STAGING_RING_BUFFERS,
+    iter_offload_moe_layers,
+    staging_ring_rows,
+)
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
@@ -1479,16 +1483,20 @@ def _resolve_expert_pin_budget(config: EngineConfig, *, reserved: int, method=No
     bank_bytes = _bank_bytes(config, method) or 0
     layers = getattr(config.model_config, "num_moe_layers", 0)
     experts = getattr(config.model_config, "num_experts", 0)
-    ring_rows = max(1, int(os.environ.get("FREETOKEN_EXPERT_RING_ROWS", "8")))
-    ring_bytes = ring_rows * bank_bytes // (layers * experts) if layers and experts else 0
+    ring_rows = staging_ring_rows()
+    ring_bytes = (
+        STAGING_RING_BUFFERS * ring_rows * bank_bytes // (layers * experts)
+        if layers and experts else 0
+    )
     return max(0, want - ring_bytes)
 
 
 def _finish_mmap_source(config: EngineConfig, cache) -> None:
     """Disable decode CUDA graphs and attach the usage-ranked prefetch plan.
 
-    The staged H2D path runs host code (ring fill + a num_indices sync) that a captured
-    graph would execute only at capture time, so staged decode must run eagerly.
+    The staged H2D path runs host code (ring fill + one num_indices/src_indices D2H sync)
+    that a captured graph would execute only at capture time, so staged decode must run
+    eagerly.
     """
     from freetoken.moe.usage import load_usage, prefetch_plan
 

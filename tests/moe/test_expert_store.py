@@ -266,6 +266,77 @@ def test_gpu_staged_copy_matches_the_store(monkeypatch, tmp_path):
         assert torch.equal(cache.bank_caches[role][:E].cpu(), source.layer_views(0)[role])
 
 
+def test_staged_copy_chunks_across_the_ring(monkeypatch, tmp_path):
+    """More misses than one ring buffer must span chunks and both double buffers."""
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    from freetoken.moe.expert_source import MmapExpertSource
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setenv("FREETOKEN_EXPERT_RING_ROWS", "2")
+    E, H, I = 8, 64, 32
+    _repack(monkeypatch, _fused_tensors(1, E, H, I), tmp_path)
+    source = MmapExpertSource.open(str(tmp_path))
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=E, cache_size=E, device=torch.device("cpu"),
+        quant_format="iq4_nl",
+    )
+    cache.set_bank_sources(source.all_layer_views(), layer_residency=["mmap"], expert_source=source)
+    assert cache._staging_rows == 2
+
+    ids = [7, 0, 3, 5, 1]
+    slots = [4, 0, 6, 2, 5]
+    cache.num_indices.fill_(len(ids))
+    cache.evict_slots[: len(ids)] = torch.tensor(slots, dtype=torch.int32)
+    cache.src_indices[: len(ids)] = torch.tensor(ids, dtype=torch.int32)
+    cache._pending_src_layer = 0
+    cache._pending_whole_layer = False
+    cache.copy_missing()
+    for role in ("gate_up", "down"):
+        view = source.layer_views(0)[role]
+        for expert, slot in zip(ids, slots):
+            assert torch.equal(cache.bank_caches[role][slot], view[expert])
+    assert cache.staged_page_layer[0] == 2 * len(ids)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_gpu_staged_copy_spans_chunks_and_buffers(monkeypatch, tmp_path):
+    """GPU staged copy across ring chunks: both double buffers + events stay correct."""
+    from freetoken.moe.expert_source import MmapExpertSource
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    monkeypatch.setenv("FREETOKEN_EXPERT_RING_ROWS", "2")
+    E, H, I = 8, 64, 32
+    _repack(monkeypatch, _fused_tensors(1, E, H, I), tmp_path)
+    source = MmapExpertSource.open(str(tmp_path))
+    device = torch.device("cuda")
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=E, cache_size=E, device=device, quant_format="iq4_nl",
+    )
+    cache.set_bank_sources(source.all_layer_views(), layer_residency=["mmap"], expert_source=source)
+    assert cache._staging_rows == 2
+
+    ids = [7, 0, 3, 5, 1]
+    slots = [4, 0, 6, 2, 5]
+    cache.num_indices.fill_(len(ids))
+    cache.evict_slots[: len(ids)] = torch.tensor(slots, dtype=torch.int32, device=device)
+    cache.src_indices[: len(ids)] = torch.tensor(ids, dtype=torch.int32, device=device)
+    cache._pending_src_layer = 0
+    cache._pending_whole_layer = False
+    cache.copy_missing()
+    torch.cuda.synchronize(device)
+    for role in ("gate_up", "down"):
+        view = source.layer_views(0)[role]
+        for expert, slot in zip(ids, slots):
+            assert torch.equal(cache.bank_caches[role][slot].cpu(), view[expert])
+    assert cache.staged_page_layer[0] == 2 * len(ids)
+
+
 def test_staged_tier_counters_split_pinned_and_page(monkeypatch, tmp_path):
     from freetoken.distributed import set_tp_info, try_get_tp_info
 

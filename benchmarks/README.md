@@ -27,5 +27,16 @@ batch size x miss rate.
 python benchmarks/bench_offload_cache_copy.py
 ```
 
+**`bench_expert_store.py`** — the mmap expert-store tier (no model load): the read paths
+(`mmap_random`, `willneed`, whole-expert buffered `preadv`, O_DIRECT) cold/warm, and
+`_copy_missing_staged` swept over ring rows x miss count with `--legacy` timing the pre-C
+loop for an A/B, plus a per-token / per-1000-token-prefill projection. Synthesizes a tiny
+store when `--store` is omitted.
+
+```bash
+python benchmarks/bench_expert_store.py --store /path/to/store --cold
+python benchmarks/bench_expert_store.py --store /path/to/store --section staged --legacy
+```
+
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.

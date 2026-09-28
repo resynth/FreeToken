@@ -25,6 +25,18 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+# Staged H2D (mmap source) moves a layer's miss rows through a double-buffered pinned ring:
+# one buffer is filled on the host while the other's pinned->CUDA copy (and device scatter)
+# is still in flight, so the loop never has to drain the whole stream between chunks. The
+# pin budget carves out both buffers.
+STAGING_RING_BUFFERS = 2
+
+
+def staging_ring_rows() -> int:
+    """Rows per staging buffer (``FREETOKEN_EXPERT_RING_ROWS``, default 8)."""
+    return max(1, int(os.environ.get("FREETOKEN_EXPERT_RING_ROWS", "8")))
+
+
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -293,9 +305,14 @@ class OffloadMoeCache:
         # usage-ranked per-layer expert ids to MADV_WILLNEED one layer ahead (None = off)
         self.usage_prefetch: list[list[int]] | None = None
         self._staging_ready = False
-        self._staging_ring: dict[str, torch.Tensor] = {}
-        self._staging_device: dict[str, torch.Tensor] = {}
-        self._staging_rows = max(1, int(os.environ.get("FREETOKEN_EXPERT_RING_ROWS", "8")))
+        self._staging_ring: dict[str, list[torch.Tensor]] = {}
+        self._staging_device: dict[str, list[torch.Tensor]] = {}
+        self._staging_events: dict[str, list[torch.cuda.Event | None]] = {}
+        self._staging_rows = staging_ring_rows()
+        # pinned D2H mirrors for the staged path's num_indices + src_indices (allocated
+        # lazily, only when a staged layer actually has misses)
+        self._staging_count_host: torch.Tensor | None = None
+        self._staging_indices_host: torch.Tensor | None = None
         # mmap tiering telemetry, per layer: rows served from the pinned warm subset vs
         # staged from the mmap/page cache. Host-side (the staged path is host-driven), so
         # plain lists, not device tensors.
@@ -433,6 +450,9 @@ class OffloadMoeCache:
         self._staging_ready = False
         self._staging_ring = {}
         self._staging_device = {}
+        self._staging_events = {}
+        self._staging_count_host = None
+        self._staging_indices_host = None
         self.layer_residency = list(residency)
         for name in self.bank_schema:
             per_layer = sources[name]
@@ -579,6 +599,10 @@ class OffloadMoeCache:
         self._staging_ready = False
         self._staging_ring = {}
         self._staging_device = {}
+        self._staging_events = {}
+        # the pinned index mirrors were sized for the old evict_slots/src_indices
+        self._staging_count_host = None
+        self._staging_indices_host = None
         self.prefill_copy_stream = None
         self.prefill_begin_event = None
         self.prefill_ready_events = []
@@ -1164,47 +1188,94 @@ class OffloadMoeCache:
             source.prefetch(nxt, plan[nxt])
 
     def _ensure_staging(self) -> None:
-        """Allocate the pinned ring + device bounce per bank (never inside graph capture)."""
+        """Allocate the double-buffered pinned ring + device bounce per bank (never inside graph capture)."""
         if self._staging_ready:
             return
+        pinned = self.device.type == "cuda"
+        if pinned:
+            from freetoken.kernel.pinned import alloc_pinned_tensor
         for role in self.bank_schema:
             cache = self.bank_caches[role]
             shape = tuple(cache.shape[1:])
-            if self.device.type == "cuda":
-                from freetoken.kernel.pinned import alloc_pinned_tensor
-
-                ring = alloc_pinned_tensor(self._staging_rows, *shape, dtype=cache.dtype)
-            else:
-                ring = torch.empty((self._staging_rows, *shape), dtype=cache.dtype)
-            self._staging_ring[role] = ring
-            self._staging_device[role] = torch.empty(
-                (self._staging_rows, *shape), dtype=cache.dtype, device=self.device
-            )
+            rings, devices, events = [], [], []
+            for _ in range(STAGING_RING_BUFFERS):
+                if pinned:
+                    rings.append(alloc_pinned_tensor(self._staging_rows, *shape, dtype=cache.dtype))
+                else:
+                    rings.append(torch.empty((self._staging_rows, *shape), dtype=cache.dtype))
+                devices.append(
+                    torch.empty((self._staging_rows, *shape), dtype=cache.dtype, device=self.device)
+                )
+                events.append(torch.cuda.Event() if pinned else None)
+            self._staging_ring[role] = rings
+            self._staging_device[role] = devices
+            self._staging_events[role] = events
         self._staging_ready = True
+
+    def _read_pending_staged(self) -> tuple[int, list[int]]:
+        """Learn this layer's staged miss count + expert ids with a single stream sync.
+
+        ``ensure_experts`` wrote ``num_indices`` and ``src_indices`` on the device and the
+        staged path is host-driven, so one D2H sync is unavoidable. Both reads share it:
+        the count and the (small) whole id buffer go to pinned host mirrors, then one
+        ``synchronize``. The id buffer is copied wholesale because the count is not known
+        until after the sync.
+        """
+        if self.device.type != "cuda":
+            n = int(self.num_indices.item())
+            if n <= 0:
+                return 0, []
+            return n, [int(e) for e in self.src_indices[:n].tolist()]
+        if self._staging_count_host is None or self._staging_indices_host is None:
+            from freetoken.kernel.pinned import alloc_pinned_tensor
+
+            self._staging_count_host = alloc_pinned_tensor(1, dtype=torch.int64)
+            self._staging_indices_host = alloc_pinned_tensor(
+                self.src_indices.numel(), dtype=self.src_indices.dtype
+            )
+        self._staging_count_host.copy_(self.num_indices, non_blocking=True)
+        self._staging_indices_host.copy_(self.src_indices, non_blocking=True)
+        torch.cuda.current_stream(self.device).synchronize()
+        n = int(self._staging_count_host.item())
+        if n <= 0:
+            return 0, []
+        return n, self._staging_indices_host[:n].tolist()
 
     def _copy_missing_staged(self, layer_id: int) -> None:
         """Resolve an LRU slot remap for an mmap-backed layer through the pinned ring.
 
         ``ensure_experts`` left ``src_indices`` (layer-local expert ids) and ``evict_slots``
-        (cache slots) on the device; a host sync reads them, the rows are staged from the
-        source (page cache or the pinned warm subset), and one H2D + device scatter lands
-        them in the slot cache. Correct but host-synchronized, so staged decode is eager.
+        (cache slots) on the device; one host sync reads both, the rows are staged from the
+        source (page cache or the pinned warm subset) into a double-buffered pinned ring,
+        and one H2D + device scatter per chunk lands them in the slot cache. The buffers
+        alternate so a chunk's copy can overlap the next chunk's host-side fill without a
+        per-chunk stream drain. Correct but host-synchronized, so staged decode is eager.
         """
-        n = int(self.num_indices.item())
+        n, src_ids = self._read_pending_staged()
         if n <= 0:
             return
         self._ensure_staging()
-        evict = self.evict_slots[:n]
-        src_ids = self.src_indices[:n].cpu().tolist()
+        evict = self.evict_slots[:n].long()
         source = self.expert_source
         read_rows = getattr(source, "read_rows_into", None)
+        cuda = self.device.type == "cuda"
         for role, (per_layer, cache) in zip(self.bank_schema, self.banks):
-            ring = self._staging_ring[role]
-            device = self._staging_device[role]
-            rows = ring.shape[0]
+            rings = self._staging_ring[role]
+            devices = self._staging_device[role]
+            events = self._staging_events[role]
+            rows = rings[0].shape[0]
+            buf = 0
             for start in range(0, n, rows):
                 m = min(rows, n - start)
                 chunk = src_ids[start : start + m]
+                ring = rings[buf]
+                device = devices[buf]
+                if cuda:
+                    # the previous use of this buffer must be off the wire before the host
+                    # refills the pinned ring / the GPU bounce
+                    done = events[buf]
+                    if done is not None:
+                        done.synchronize()
                 if read_rows is not None:
                     # mmap source: one buffered whole-expert pread per miss (page-cache
                     # warm), not one 4 KiB fault per page on the mapping
@@ -1224,12 +1295,11 @@ class OffloadMoeCache:
                         else:
                             row = per_layer[layer_id][expert]
                         ring[c].copy_(row)
-                device[:m].copy_(ring[:m], non_blocking=True)
-                cache.index_copy_(0, evict[start : start + m].long(), device[:m])
-                if start + m < n and self.device.type == "cuda":
-                    # the next chunk refills `ring` on the CPU while this chunk's pinned->CUDA
-                    # DMA may still be reading it; drain the copy before overwriting the ring
-                    torch.cuda.current_stream(self.device).synchronize()
+                device[:m].copy_(ring[:m], non_blocking=cuda)
+                cache.index_copy_(0, evict[start : start + m], device[:m])
+                if cuda:
+                    events[buf].record()
+                buf ^= 1
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
