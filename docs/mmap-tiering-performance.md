@@ -457,6 +457,13 @@ The documented M3 path works, with two caveats found in the code:
 The output improves hit rate and overlap, not raw cold-read volume.
 
 ### H. Make staged decode graph-capturable - Impact Med-High, Effort L
+_(planned, not started: [mmap-staged-graph-capture.md](mmap-staged-graph-capture.md).
+The plan's gate (M0) comes first - measure whether the eager overhead is really the
+term that matters on this model before writing capture code; I and J both measured as
+washes on this NVMe, so the prior is that the PCIe term, not launch overhead, dominates
+staged decode here, and H is polish rather than the "unusably slow" fix. The cheap
+variant is segment capture (non-MoE graphs, MoE eager); the full variant generalizes
+the CPU executor's graph-replay-safe flag handshake to the ring fill.)_
 The host-driven gather/sync is fundamentally uncapturable. Options: keep CUDA graphs for all
 non-MoE work and only run MoE eagerly; or move the miss list to a graph-safe path (device-side
 pinned-mirror read + captureable copy descriptors). Long-term and risky; revisit after D.
@@ -618,7 +625,8 @@ surfaces:
    H only pays on staged GPU decode, which `--moe-strategy cpu` avoids entirely; K last,
    per its own risk notes). _J done: hot banks + `--hot-only`, but measured ~1.0x on
    this NVMe (see Status) - infrastructure for other storage classes, not a win here.
-   Remaining: H (only for staged GPU decode), K._
+   H planned in [mmap-staged-graph-capture.md](mmap-staged-graph-capture.md), gated on
+   its own measurement (M0). Remaining: H (gated), K._
 
 M (the `benchmarks/bench_expert_store.py` harness) is the measurement gate for all of the
 above; run it before and after any ring/source policy change.
