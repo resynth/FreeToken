@@ -40,7 +40,9 @@ borrowed `ggml_moe_a8_vec` kernel. Bank layout is one `gate_up [E, 2I, row_bytes
 `down [E, H, row_bytes(I)]` per layer, so the checkpoint may quantize gate/up and down
 differently; that is a **composite format tag** `<gate_up>+<down>` (e.g. `iq4_xs+iq4_nl`).
 `expert_quant` / `moe_weight_format` hold that tag, and the engine/cache/kernel dispatch read
-the per-role types from it.
+the per-role types from it. `--moe-strategy cpu`/hybrid supports composites too: the CPU
+executor keeps a dot kernel and row stride per role, and both roles share the one Q8_0-per-32
+activation quantization.
 
 The expert banks are read once at startup into **pinned host RAM** and streamed to a
 GPU LRU slot cache (`--moe-cache-size` / `--moe-cache-auto`). When the full packed expert
@@ -116,7 +118,7 @@ pin with `--expert-pin-fraction`; to calibrate, run `ft experts stats --model <g
 - `tests/models/test_gguf_reader_split.py` — split shards (synthetic + real).
 - `tests/moe/test_gguf_experts.py`, `tests/layers/test_gguf_dispatch.py` — expert/service
   wiring and dispatch-set guards.
-- `tests/moe/test_cpu_moe_gguf_quants.py` — CPU W4A8 vs GPU.
+- `tests/moe/test_cpu_moe_gguf_quants.py` — CPU W4A8 vs GPU (singles and composites).
 - `tests/models/test_gguf_qwen4exp_config.py` — qwen4exp config/plan/PLE-source (synthetic;
   real checkpoint behind `FREETOKEN_QWEN4EXP_GGUF`).
 
@@ -175,9 +177,13 @@ pin with `--expert-pin-fraction`; to calibrate, run `ft experts stats --model <g
   that vary the type per layer are rejected for now.
 - FTW conversion is not wired for `qwen4exp`: a metadata-only GGUF has no tensor table, so the
   quant plan cannot be derived; it would need the plan persisted at convert time.
-- CPU/hybrid MoE only supports single-type (non-composite) expert formats.
-- `moe/bench_profile.py` / `benchbw.py` have no entries for the new formats, so
-  `--moe-strategy auto` stays on GPU offload unless overridden.
+- CPU/hybrid MoE supports composite GGUF tags only when both roles are native-GGUF W4A8
+  formats (`<gate_up>+<down>`, e.g. `iq4_xs+iq4_nl`): they share the Q8_0-per-32 activation
+  grid, so one quantization pass feeds both. A pair with different activation grids must
+  match across roles.
+- The GGUF tags (including `iq4_xs+iq4_nl`) are now benched by `ft bench bw --dtype` and
+  mapped in `bench_profile`, so such a profile can upgrade `--moe-strategy auto` to hybrid;
+  without one, auto stays on offload.
 - CPU Q5_K GEMV recomputes the per-32 activation sum inside every output-row dot
   (`cpu_moe_ext.cpp: gguf_asum32`), so it does ~`2I + H` redundant sums per token/route.
   Precomputing the sums in the activation-quantization pass would remove it; left undone

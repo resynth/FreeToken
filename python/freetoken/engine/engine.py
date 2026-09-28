@@ -1316,7 +1316,11 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     """Whether an automatic CPU-decode decision may target the CPU MoE executor.
 
     A default boot must degrade to GPU offload instead of crashing in CpuMoeExecutor after the whole load; explicit cpu/hybrid/--moe-cpu-layers picks still fail loudly."""
-    from freetoken.moe.cpu_executor import _WFMT_IDS, compiled_extension_supports
+    from freetoken.moe.cpu_executor import (
+        compiled_extension_supports,
+        compiled_extension_supports_composite,
+        cpu_moe_format_supported,
+    )
 
     try:
         from freetoken.kernel import _cpu_moe  # noqa: F401
@@ -1330,7 +1334,12 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
-    return fmt == "mxfp4" or fmt in _WFMT_IDS
+    if fmt == "mxfp4":
+        return True
+    if not cpu_moe_format_supported(fmt):
+        return False
+    # A composite needs the per-role ctor arg; a stale .so must degrade auto to offload.
+    return "+" not in fmt or compiled_extension_supports_composite()
 
 
 def _mem_available_bytes() -> int | None:

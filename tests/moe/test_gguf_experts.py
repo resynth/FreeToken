@@ -201,6 +201,22 @@ def test_composite_format_resolves_in_and_getitem() -> None:
     assert "bogus+nope" not in _BANK_SCHEMAS
 
 
+def test_cpu_moe_accepts_gguf_composites() -> None:
+    """The CPU executor resolves a '+' tag into per-role formats; only GGUF W4A8 pairs
+    qualify, since those share the Q8_0/32 activation grid."""
+    from freetoken.moe.cpu_executor import _role_formats, cpu_moe_format_supported
+
+    assert cpu_moe_format_supported("iq4_xs+iq4_nl")
+    assert cpu_moe_format_supported("q5_K+iq4_nl")
+    assert cpu_moe_format_supported("q5_K")
+    assert _role_formats("iq4_xs+iq4_nl") == ("iq4_xs", "iq4_nl")
+    assert _role_formats("q4_0") == ("q4_0", "q4_0")
+    assert not cpu_moe_format_supported("iq4_xs+bf16")  # mixed activation grids
+    assert not cpu_moe_format_supported("nvfp4+q4_0")
+    assert not cpu_moe_format_supported("fp8_block")
+    assert not cpu_moe_format_supported("q4_0+q4_0+q4_0")
+
+
 def test_expert_format_detects_a_fused_gate_up_tensor(monkeypatch) -> None:
     from freetoken.models.gguf import reader
     from freetoken.moe.gguf_experts import gguf_expert_format

@@ -1550,6 +1550,21 @@ inline bool is_gguf_w4a8(int fmt) {
   return fmt == WF_Q4_0 || fmt == WF_IQ4_NL || fmt == WF_IQ4_XS || fmt == WF_Q5_K;
 }
 
+// The 32-element IQ4/Q4 block formats; the K-quants super-block every 256.
+inline int gguf_block_elems(int fmt) {
+  return (fmt == WF_Q4_0 || fmt == WF_IQ4_NL) ? 32 : 256;
+}
+
+inline const char* gguf_fmt_name(int fmt) {
+  switch (fmt) {
+    case WF_Q4_0: return "q4_0";
+    case WF_IQ4_NL: return "iq4_nl";
+    case WF_IQ4_XS: return "iq4_xs";
+    case WF_Q5_K: return "q5_k";
+    default: return "?";
+  }
+}
+
 // Per-format W4A8 dot, picking the best tier the CPU+build supports.
 q4dot_fn select_gguf_dot(int fmt) {
   const IsaTier t = pick_isa();
@@ -1584,7 +1599,8 @@ struct CpuMoeExecutor {
   int num_layers, num_experts, top_k;
   int H, I;
   int act, apply_on_input;
-  int fmt;                // WFmt
+  int fmt;                // WFmt: the gate_up role (and the layout/act-branch key)
+  int dn_fmt;             // WFmt: the down role; == fmt unless a composite GGUF tag
   bool needs_di = false;  // pre-deinterleave activations to fp32 (nvfp4/ds_fp4)
   // Per-layer pointer tables (one base address per layer, see tbl_at). gate_up_tbl
   // doubles as the bf16 gate_up table and the nvfp4/mxfp4/q4_0/ds_fp4 packed-gate_up
@@ -1607,7 +1623,12 @@ struct CpuMoeExecutor {
   bool use_q4a8 = false;       // native GGUF W4A8 (Q4_0/IQ4_NL/IQ4_XS/Q5_K): int8 pre-quant
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
-  q4dot_fn q4dot;
+  // Native-GGUF W4A8 dots, one per role: a composite tag (e.g. iq4_xs+iq4_nl) packs
+  // gate_up and down with different block codecs even though both consume the same
+  // Q8_0/int8 activations (asb is per-32 for every format). Single-format models set
+  // both to the same kernel.
+  q4dot_fn q4dot_gu;
+  q4dot_fn q4dot_dn;
   // ds_fp4: the caller already FP8-round-tripped the input activations on the GPU
   // (same reference grid), so submit() must not repeat it on the host-callback
   // thread. That scalar per-element pass is single-threaded ON THE DECODE CRITICAL
@@ -1700,7 +1721,8 @@ struct CpuMoeExecutor {
   CpuMoeExecutor(int num_threads_, int num_layers_, int num_experts_, int top_k_,
                  int hidden_size, int inter_size, int max_tokens, int activation_id,
                  int apply_router_weight_on_input, int weight_format,
-                 uintptr_t gate_up_ptr, uintptr_t down_ptr, uintptr_t gate_up_scale_ptr,
+                 int down_weight_format, uintptr_t gate_up_ptr, uintptr_t down_ptr,
+                 uintptr_t gate_up_scale_ptr,
                  uintptr_t gate_up_global_ptr, uintptr_t down_scale_ptr,
                  uintptr_t down_global_ptr, uintptr_t gate_up_bias_ptr,
                  uintptr_t down_bias_ptr, double swiglu_alpha_, double swiglu_limit_,
@@ -1714,6 +1736,7 @@ struct CpuMoeExecutor {
         act(activation_id),
         apply_on_input(apply_router_weight_on_input),
         fmt(weight_format),
+        dn_fmt(down_weight_format),
         gate_up_tbl(reinterpret_cast<const uint64_t*>(gate_up_ptr)),
         down_tbl(reinterpret_cast<const uint64_t*>(down_ptr)),
         gu_scale_tbl(reinterpret_cast<const uint64_t*>(gate_up_scale_ptr)),
@@ -1730,14 +1753,23 @@ struct CpuMoeExecutor {
     nvdot = select_nvdot();
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
-    q4dot = select_gguf_dot(weight_format);
-    if (is_gguf_w4a8(weight_format)) {
-      const int blk = (weight_format == WF_Q4_0 || weight_format == WF_IQ4_NL) ? 32 : 256;
-      if (H % blk != 0 || I % blk != 0)
+    q4dot_gu = select_gguf_dot(fmt);
+    q4dot_dn = select_gguf_dot(dn_fmt);
+    // A composite tag may only pair two native-GGUF W4A8 formats: they share the Q8_0
+    // per-32 activation grid, so one quant_q8_0 pass feeds both roles. gate_up and down
+    // may still use different block codecs (iq4_xs gate/up + iq4_nl down).
+    if (is_gguf_w4a8(fmt) != is_gguf_w4a8(dn_fmt))
+      throw std::runtime_error(
+          "GGUF 4-bit CPU MoE requires both expert roles to be GGUF W4A8 formats");
+    use_q4a8 = is_gguf_w4a8(fmt);
+    if (use_q4a8) {
+      // Per-role block divisibility: H sizes the gate_up rows (gate_up block), I the
+      // down rows (down block); a composite can impose a 256-block on one role only.
+      if (H % gguf_block_elems(fmt) != 0 || I % gguf_block_elems(dn_fmt) != 0)
         throw std::runtime_error(
-            "GGUF 4-bit CPU MoE requires H and I to be multiples of the block size");
-      q4_gu_row_bytes = gguf_row_bytes(weight_format, H);  // K = H (gate_up rows)
-      q4_dn_row_bytes = gguf_row_bytes(weight_format, I);  // K = I (down rows)
+            "GGUF 4-bit CPU MoE requires H and I to be multiples of their role's block size");
+      q4_gu_row_bytes = gguf_row_bytes(fmt, H);  // K = H (gate_up rows)
+      q4_dn_row_bytes = gguf_row_bytes(dn_fmt, I);  // K = I (down rows)
     }
     isa = c.name;
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. The native-GGUF
@@ -1745,16 +1777,15 @@ struct CpuMoeExecutor {
     // the per-format VPDPBUSD / VPMADDUBSW / scalar kernel for the tier.
     nvi8dot = select_nvi8dot();
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
-    use_q4a8 = is_gguf_w4a8(weight_format);
     const char* q4tag = "";
     if (use_q4a8) {
-      const char* fmtname = weight_format == WF_IQ4_NL ? "iq4_nl"
-                            : weight_format == WF_IQ4_XS ? "iq4_xs"
-                            : weight_format == WF_Q5_K ? "q5_k"
-                                                       : "q4_0";
       const char* tier = cpu_has_avxvnni() ? "vnni" : "tier";
-      static thread_local char q4buf[64];
-      std::snprintf(q4buf, sizeof(q4buf), "+%s(%s-w4a8)", tier, fmtname);
+      static thread_local char q4buf[96];
+      if (fmt == dn_fmt)
+        std::snprintf(q4buf, sizeof(q4buf), "+%s(%s-w4a8)", tier, gguf_fmt_name(fmt));
+      else
+        std::snprintf(q4buf, sizeof(q4buf), "+%s(%s+%s-w4a8)", tier, gguf_fmt_name(fmt),
+                      gguf_fmt_name(dn_fmt));
       q4tag = q4buf;
     }
     const char* vnni_tag =
@@ -1852,7 +1883,7 @@ struct CpuMoeExecutor {
     if (is_gguf_w4a8(fmt)) {
       const uint8_t* w =
           gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
-      return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
+      return q4dot_gu(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
     }
     const size_t r = (size_t)e * (2 * I) + row;
     if (use_vnni)
@@ -1872,9 +1903,9 @@ struct CpuMoeExecutor {
       const bf16_t* w = down_l + ((size_t)e * H + row) * I;
       return dot(w, g, I);
     }
-    if (is_gguf_w4a8(fmt)) {
+    if (is_gguf_w4a8(dn_fmt)) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
-      return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
+      return q4dot_dn(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
     }
     const size_t r = (size_t)e * H + row;
     if (use_vnni)
@@ -2474,13 +2505,14 @@ struct CpuMoeExecutor {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   namespace py = pybind11;
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
-      .def(py::init<int, int, int, int, int, int, int, int, int, int, uintptr_t, uintptr_t,
+      .def(py::init<int, int, int, int, int, int, int, int, int, int, int, uintptr_t,
                     uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
-                    double, double, std::vector<int>>(),
+                    uintptr_t, double, double, std::vector<int>>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
            py::arg("apply_router_weight_on_input"), py::arg("weight_format"),
+           py::arg("down_weight_format"),
            py::arg("gate_up_ptr"), py::arg("down_ptr"), py::arg("gate_up_scale_ptr"),
            py::arg("gate_up_global_ptr"), py::arg("down_scale_ptr"),
            py::arg("down_global_ptr"), py::arg("gate_up_bias_ptr"),
@@ -2517,4 +2549,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
   m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLU_CLAMP); });
+  // ABI capability marker: this build's ctor takes a down_weight_format (per-role
+  // composite expert formats, e.g. iq4_xs+iq4_nl). A prebuilt .so from before it
+  // raises a pybind TypeError on the unknown kwarg; cpu_executor probes this so a
+  // stale extension keeps single-format CPU/hybrid working and fails a composite
+  // with a rebuild instruction.
+  m.def("supports_down_weight_format", []() { return true; });
 }

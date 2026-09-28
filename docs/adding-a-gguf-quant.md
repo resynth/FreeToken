@@ -34,7 +34,15 @@ each step names the symbol and the test that proves it.
 - Extend `WFmt` (must match `moe/cpu_executor._WFMT_IDS`), add scalar + AVX2 + AVX-VNNI
   `_dot_i8_*` kernels, wire `select_gguf_dot` and `gguf_row_bytes`/`is_gguf_w4a8`.
 - Add the format to `_GGUF_W4A8_FORMATS`; `_resolve_gguf_banks` validates per-role row bytes.
-- Note the C++ executor picks **one** dot per executor, so composite formats are GPU-only.
+- Composites are supported: `CpuMoeExecutor` takes a `down_weight_format` and keeps a
+  separate per-role dot (`q4dot_gu`/`q4dot_dn`) and row stride, so any pair of the
+  `_GGUF_W4A8_FORMATS` works as long as each role's K is a multiple of its block
+  (`_role_formats` / `cpu_moe_format_supported`). Both roles share the one Q8_0/32 activation
+  quantization. A stale prebuilt extension (no `supports_down_weight_format` marker) keeps
+  single formats working and fails a composite with a rebuild instruction.
+- To let `--moe-strategy auto` choose hybrid for the tag, add it to `benchbw._GGUF_BLOCKS`
+  (block geometry), a `benchbw.DTYPE_WORKLOADS` entry, and
+  `bench_profile._QUANT_TO_BENCH_FORMAT`.
 
 ## 5. Tests
 - `tests/models/test_gguf_dequant.py`: add to `EXPECTED_SHAPE`, write a `_ref_<type>` literal

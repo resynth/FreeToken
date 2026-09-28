@@ -95,6 +95,23 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
   `SamplingParams(max_new_tokens=...)`, which is now mapped to `max_tokens`. Still open: the
   offline pass runs eagerly (slow until D/E), and the live histogram is not wired to
   `--moe-collect-stats`.
+- **E - implemented.** The C++ `CpuMoeExecutor` now takes a per-role weight format
+  (`weight_format` + `down_weight_format`), keeps two dot kernels (`q4dot_gu`/`q4dot_dn`)
+  and per-role row strides (`q4_gu_row_bytes`/`q4_dn_row_bytes`), and checks H/I
+  divisibility against each role's own block size (a composite can impose a 256-block on
+  gate_up only). The shared Q8_0-per-32 activation quantization is unchanged, which is what
+  makes the pair cheap: every GGUF W4A8 dot consumes the same int8 grid, so one
+  `quant_q8_0` pass feeds both roles. Python resolves a `'+'` tag into roles
+  (`moe/cpu_executor.py: _role_formats` / `cpu_moe_format_supported`), so
+  `_resolve_gguf_banks` passes both format ids, `CpuMoeExecutor` accepts the composite, and
+  `engine._cpu_moe_executor_viable` no longer rejects it. `benchbw.py` synthesizes packed
+  GGUF/composite banks for the per-dtype tuning bench and
+  `bench_profile._QUANT_TO_BENCH_FORMAT` maps the tags, so `--moe-strategy auto` can pick
+  hybrid for them. A stale prebuilt `_cpu_moe.so` is detected via the
+  `supports_down_weight_format` marker: single formats keep the old ctor, a composite fails
+  with a rebuild instruction, and auto degrades to offload. Covered by
+  `tests/moe/test_cpu_moe_gguf_quants.py` (CPU-vs-GPU
+  equivalence on `iq4_xs+iq4_nl`, `iq4_nl+iq4_xs` and the singles).
 
 Local C A/B against the real store (`layer-000`, `gate_up`, cache_size 512, ring rows 8,
 `--legacy`, page-warm, 21 reps). Only the chunked cases move; a single-chunk layer is
@@ -245,22 +262,25 @@ Feasibility check against the code:
   This is the most likely way to match ik_llama.cpp, but it is more work than A-C.
 
 ### E. Composite expert support in the CPU extension - Impact High (with D), Effort M
-`docs/gguf.md:146` records "CPU/hybrid MoE only supports single-type (non-composite) expert
-formats"; this section is what removing that limit takes. `CpuMoeExecutor` takes one
-`weight_format`; a composite tag is rejected
+_(implemented, see Status)_
+`docs/gguf.md` "Known limits" previously recorded "CPU/hybrid MoE only supports single-type
+(non-composite) expert formats"; this section is what removing that limit took.
+`CpuMoeExecutor` took one
+`weight_format`; a composite tag was rejected
 (`moe/cpu_executor.py:178-183`). The change is smaller than it looks because gate_up and down
 only differ in the **weight** format - activations are Q8_0 per-32 for every GGUF W4A8 dot
 (`iq4_nl_dot_i8_*` / `iq4_xs_dot_i8_*` both index `asb[b]`; `cpu_moe_ext.cpp:1363-1458`).
 Concretely:
 - C++ (`cpu_moe_ext.cpp`): add a `down_weight_format` ctor arg; store `gu_fmt`/`dn_fmt`; two
   `q4dot_fn`s; `q4_gu_row_bytes = gguf_row_bytes(gu_fmt, H)`, `q4_dn_row_bytes =
-  gguf_row_bytes(dn_fmt, I)`; per-role block-divisibility checks (currently `:1733-1740` is
-  single-format); `gemm1_dot` uses the gu dot (`:1852-1855`), `gemm2_dot` the dn dot
-  (`:1875-1877`). Keep `use_q4a8` and `quant_q8_0` unchanged.
+  gguf_row_bytes(dn_fmt, I)`; per-role block-divisibility checks (the single-format check
+  is now per role); `gemm1_dot` uses the gu dot (`:1852-1855`), `gemm2_dot` the dn dot
+  (`:1875-1877`). Keep `use_q4a8` and `quant_q8_0` unchanged. _(done)_
 - Python: in `_resolve_gguf_banks` (already computes `gate_up_type, down_type` from the tag)
   pass both format ids; relax the `CpuMoeExecutor` gate; relax `_cpu_moe_executor_viable`.
+  _(done)_
 - Also add the GGUF formats to `bench_profile._QUANT_TO_BENCH_FORMAT` (and `benchbw.py`) so
-  `--moe-strategy auto` can ever choose hybrid for them (`docs/gguf.md:147-148`).
+  `--moe-strategy auto` can ever choose hybrid for them. _(done)_
 Roughly a day including a CPU-vs-GPU equivalence test (there is already
 `tests/moe/test_cpu_moe_gguf_quants.py` to extend).
 
@@ -409,7 +429,10 @@ whole-layer prefill path reads and makes serving much slower; on this 62 GiB hos
 Yes, probably the largest steady-state win here, because it removes the PCIe term (root cause
 5) and matches a RAM-resident working set. Work to unblock: E (composite in the CPU ext, ~1
 day, low risk because activations are already shared) + wiring the mmap source to the CPU
-executor (D) + bench-profile entries. It does not require the banks to be pinned, so it also
+executor (D) + bench-profile entries. **E and the bench-profile entries are done** (see
+Status); **D remains**: `--moe-strategy cpu` / `--moe-cpu-layers` still force the pinned
+source (`_select_expert_source`), so the CPU executor cannot yet read the mmap store
+directly. The CPU path does not require the banks to be pinned, so it also
 solves the "banks don't fit the pin budget" problem rather than working around it. It will not
 be fast if cold reads still fault per page, so A remains a prerequisite.
 
@@ -483,6 +506,7 @@ surfaces:
    (`--expert-warm-file`); G's store-flag forwarding + test done, the eager calibration run
    remains slow until D/E._
 5. E + D (composite CPU ext, then CPU/hybrid over the mmap store) - the big architectural win.
+   _E done (plus bench-profile entries); D remains._
 6. H, J, K as follow-ups.
 
 M (the `benchmarks/bench_expert_store.py` harness) is the measurement gate for all of the
@@ -541,7 +565,13 @@ See `docs/mmap-tiering-performance.md` for the full status and numbers.
   not the pinned buffers, so a large pin (44 GiB here) evicts the cache prefill needs and makes
   serving much slower - see the "F caveat" under Suggested fixes. Prefer `--expert-warm` with
   no pin or a small `--expert-pin-fraction` until the prefill path is pin-aware or D/E lands.
-- **Still open:** `--moe-strategy cpu`/hybrid is blocked on composite `iq4_xs+iq4_nl`
-  support in the CPU MoE extension (E) plus wiring the mmap source to the CPU executor (D);
-  that removes the PCIe term and is the big architectural win.
+- **Composite CPU experts (E, done):** the CPU MoE extension takes a per-role weight format
+  and keeps a dot kernel + row stride per role, so `iq4_xs+iq4_nl` (and any pair of
+  native-GGUF W4A8 tags) computes on the CPU over the same packed banks, sharing the Q8_0/32
+  activation quantization. `benchbw`/`bench_profile` carry the tags, so `--moe-strategy auto`
+  can pick hybrid for them; `tests/moe/test_cpu_moe_gguf_quants.py` adds CPU-vs-GPU parity for
+  the composite.
+- **Still open:** `--moe-strategy cpu`/hybrid over the mmap store is blocked on wiring the
+  mmap source to the CPU executor (D) - E is done, and D removes the PCIe term and is the big
+  architectural win.
 

@@ -66,6 +66,30 @@ logger = init_logger(__name__)
 _CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
 _BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
+# Native-GGUF W4A8 expert formats, tag -> (block_elems, block_bytes): the ggml block
+# geometry used to size a packed row (see models/gguf/dequant.py BLOCK_SHAPE). A composite
+# "<gate_up>+<down>" tag (e.g. iq4_xs+iq4_nl) packs each role with its own block, which is
+# exactly the case the CPU executor's per-role dot kernels exist for.
+_GGUF_BLOCKS = {"q4_0": (32, 18), "iq4_nl": (32, 18), "iq4_xs": (256, 136), "q5_K": (256, 176)}
+
+
+def _gguf_roles(fmt: str) -> tuple[str, str] | None:
+    """(gate_up, down) native-GGUF tags for ``fmt``, or None if it is not (a composite of) them."""
+    parts = fmt.split("+")
+    if 1 <= len(parts) <= 2 and all(p in _GGUF_BLOCKS for p in parts):
+        return (parts[0], parts[1]) if len(parts) == 2 else (parts[0], parts[0])
+    return None
+
+
+def _has_cpu_moe_path(fmt: str) -> bool:
+    """Whether the CPU MoE C++ kernel can compute ``fmt`` (single format or GGUF composite)."""
+    return fmt in _CPU_MOE_FORMATS or _gguf_roles(fmt) is not None
+
+
+def _is_buildable(fmt: str) -> bool:
+    return fmt in _BUILDABLE_FORMATS or _gguf_roles(fmt) is not None
+
+
 # Friendlier CLI/display aliases for the internal quant_format strings.
 _FORMAT_ALIASES = {"fp8": "fp8_block", "mxfp4": "mxfp4_triton"}
 _FORMAT_DISPLAY = {"fp8_block": "fp8", "mxfp4_triton": "mxfp4"}
@@ -143,6 +167,14 @@ DTYPE_WORKLOADS: dict[str, Workload] = {
     "mxfp4_triton": Workload("dtype:mxfp4", 2880, 2880, 128, 4, ("mxfp4_triton",),
                              activation="gpt_oss_swiglu", swiglu_limit=7.0),
     "ds_fp4": Workload("dtype:ds_fp4", 4096, 2048, 128, 6, ("ds_fp4",), swiglu_limit=7.0),
+    # Native-GGUF W4A8. H/I are 256-aligned so the K-quant super-blocks fit either role;
+    # the composite uses the 512-expert qwen3.8 geometry, where I=640 is only 32-aligned
+    # (hence IQ4_XS gate/up + IQ4_NL down).
+    "q4_0": Workload("dtype:q4_0", 2048, 768, 128, 8, ("q4_0",)),
+    "iq4_nl": Workload("dtype:iq4_nl", 2048, 768, 128, 8, ("iq4_nl",)),
+    "iq4_xs": Workload("dtype:iq4_xs", 2048, 768, 128, 8, ("iq4_xs",)),
+    "q5_K": Workload("dtype:q5_K", 2048, 768, 128, 8, ("q5_K",)),
+    "iq4_xs+iq4_nl": Workload("dtype:iq4_xs+iq4_nl", 2560, 640, 128, 10, ("iq4_xs+iq4_nl",)),
 }
 
 
@@ -309,6 +341,15 @@ def _offload_bank_specs(fmt: str, H: int, I: int) -> dict[str, tuple[int, torch.
             "gate_up_packed": (2 * I * (H // 2), u8), "gate_up_scale": (2 * I * (H // 32), u8),
             "down_packed": (H * (I // 2), u8), "down_scale": (H * (I // 32), u8),
         }
+    roles = _gguf_roles(fmt)
+    if roles is not None:
+        gu, dn = roles
+        gu_blk, gu_sz = _GGUF_BLOCKS[gu]
+        dn_blk, dn_sz = _GGUF_BLOCKS[dn]
+        return {
+            "gate_up": (2 * I * (H // gu_blk) * gu_sz, u8),
+            "down": (H * (I // dn_blk) * dn_sz, u8),
+        }
     raise NotImplementedError(fmt)
 
 
@@ -376,6 +417,18 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         b["gate_up_scale"].fill_(127)  # e8m0 unit exponent
         b["down_scale"].fill_(127)
         return b
+    roles = _gguf_roles(fmt)
+    if roles is not None:
+        # Packed block bytes per output row (the exact layout load_gguf_expert_sources
+        # builds). All-zero packed blocks decode to a zero fp16 scale -> zero weights;
+        # finite and non-denormal, so no fill is needed.
+        gu, dn = roles
+        gu_blk, gu_sz = _GGUF_BLOCKS[gu]
+        dn_blk, dn_sz = _GGUF_BLOCKS[dn]
+        return {
+            "gate_up": pin(E, 2 * I, (H // gu_blk) * gu_sz, dtype=torch.uint8),
+            "down": pin(E, H, (I // dn_blk) * dn_sz, dtype=torch.uint8),
+        }
     raise NotImplementedError(fmt)
 
 
@@ -633,7 +686,7 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
     finally:
         torch.cuda.empty_cache()
 
-    if fmt not in _CPU_MOE_FORMATS:
+    if not _has_cpu_moe_path(fmt):
         _note(entry, f"CPU MoE has no {fmt} weight path; hybrid unavailable")
     else:
         try:
@@ -910,10 +963,11 @@ def _dtype_list(s: str) -> tuple[str, ...]:
 
 def _format_list(s: str) -> tuple[str, ...]:
     items = [_FORMAT_ALIASES.get(x.strip(), x.strip()) for x in s.split(",") if x.strip()]
-    bad = [x for x in items if x not in _BUILDABLE_FORMATS]
+    known = sorted(_BUILDABLE_FORMATS | set(_GGUF_BLOCKS))
+    bad = [x for x in items if not _is_buildable(x)]
     if bad or not items:
         raise argparse.ArgumentTypeError(
-            f"comma-separated subset of {sorted(_BUILDABLE_FORMATS)} (aliases "
+            f"comma-separated subset of {known} (aliases "
             f"{sorted(_FORMAT_ALIASES)}), got {s!r}"
         )
     return tuple(dict.fromkeys(items))

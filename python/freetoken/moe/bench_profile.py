@@ -21,13 +21,20 @@ logger = init_logger(__name__)
 # Engine ``expert_quant`` (models/config.py) -> benchbw format key (offload_cache._BANK_SCHEMAS
 # / benchbw._offload_bank_specs). Only the offload-family formats with a CPU MoE weight path can
 # ever resolve to hybrid; anything not listed falls through unmapped and finds no profile entry
-# (-> None -> offload), which is the safe default.
+# (-> None -> offload), which is the safe default. The native-GGUF W4A8 tags (including a
+# composite ``<gate_up>+<down>`` such as ``iq4_xs+iq4_nl``) are already the benchbw keys, so
+# the identity mappings just document that the CPU MoE kernel now has those weight paths.
 _QUANT_TO_BENCH_FORMAT = {
     "nvfp4": "nvfp4",
     "ds_fp4": "ds_fp4",
     "mxfp4": "mxfp4_triton",
     "bf16": "bf16",
     "fp8_block": "fp8_block",
+    "q4_0": "q4_0",
+    "iq4_nl": "iq4_nl",
+    "iq4_xs": "iq4_xs",
+    "q5_K": "q5_K",
+    "iq4_xs+iq4_nl": "iq4_xs+iq4_nl",
 }
 
 

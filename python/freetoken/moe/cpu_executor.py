@@ -84,6 +84,43 @@ _WFMT_IDS = {
 }
 
 
+def cpu_moe_format_supported(fmt: str) -> bool:
+    """Whether the compiled CPU MoE path can compute an expert-format tag.
+
+    A native-GGUF composite tag (``iq4_xs+iq4_nl``: different block codecs for
+    gate_up and down) is supported as long as *both* roles are GGUF W4A8 formats:
+    they all consume the same Q8_0/int8 per-32 activation grid, so one quantization
+    pass feeds both roles (see csrc/cpu_moe/cpu_moe_ext.cpp). Any other tag must
+    name a single supported format.
+    """
+    parts = fmt.split("+")
+    if len(parts) == 1:
+        return parts[0] in _WFMT_IDS
+    return len(parts) == 2 and all(p in _GGUF_W4A8_FORMATS for p in parts)
+
+
+def _role_formats(fmt: str) -> tuple[str, str]:
+    """(gate_up, down) weight-format names for a checkpoint expert-format tag."""
+    if "+" in fmt:
+        gate_up, down = fmt.split("+", 1)
+        return gate_up, down
+    return fmt, fmt
+
+
+def compiled_extension_supports_composite() -> bool:
+    """Whether the compiled ``_cpu_moe`` extension takes a per-role down format.
+
+    A prebuilt .so from before composites raises a pybind TypeError on the
+    ``down_weight_format`` kwarg; the executor gates on this so single-format
+    cpu/hybrid keeps working on a stale build and a composite fails with a rebuild
+    instruction instead of an obscure ctor error."""
+    try:
+        from freetoken.kernel import _cpu_moe
+    except ImportError:
+        return False
+    return bool(getattr(_cpu_moe, "supports_down_weight_format", lambda: False)())
+
+
 def compiled_extension_supports(activation: str) -> bool:
     """Whether the compiled ``_cpu_moe`` extension can serve ``activation``
     through its generic epilogue. A stale prebuilt .so accepts newer act ids
@@ -155,7 +192,8 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
 
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
-    (bf16, nvfp4, mxfp4_triton, ds_fp4 or q4_0 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
+    (bf16, nvfp4, mxfp4_triton, ds_fp4 or the native-GGUF W4A8 formats, including a
+    composite ``gate_up+down`` tag -- see ``_WFMT_IDS`` / ``_role_formats``)."""
 
     def __init__(
         self,
@@ -175,10 +213,12 @@ class CpuMoeExecutor:
         from freetoken.moe.legacy_format import canonical_role
 
         fmt = fmt or cache.quant_format
-        if fmt not in _WFMT_IDS:
+        gu_fmt, dn_fmt = _role_formats(fmt)
+        if not cpu_moe_format_supported(fmt):
             raise NotImplementedError(
                 f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
-                f"{sorted(_WFMT_IDS)} formats, but this checkpoint's experts are "
+                f"{sorted(_WFMT_IDS)} formats (or a native-GGUF composite of two of "
+                f"{sorted(_GGUF_W4A8_FORMATS)}), but this checkpoint's experts are "
                 f"{fmt!r}; use --moe-strategy offload (GPU-side dequant) instead."
             )
         if activation not in _ACT_IDS:
@@ -239,6 +279,17 @@ class CpuMoeExecutor:
             nthreads -= 1
             core_ids = core_ids[:-1]
         self._coord_core = coord_core
+        if compiled_extension_supports_composite():
+            role_fmt_kwargs = {"down_weight_format": _WFMT_IDS[dn_fmt]}
+        elif gu_fmt != dn_fmt:
+            raise RuntimeError(
+                f"the compiled _cpu_moe extension predates composite expert formats "
+                f"({fmt!r}); rebuild it with `python setup.py build_ext --inplace` "
+                "(or reinstall the wheel) before serving this model on the cpu/hybrid "
+                "backend."
+            )
+        else:
+            role_fmt_kwargs = {}  # stale .so, single format: the ctor takes one format
         self._ext = _cpu_moe.CpuMoeExecutor(
             num_threads=nthreads,
             num_layers=self.num_layers,
@@ -249,7 +300,8 @@ class CpuMoeExecutor:
             max_tokens=self.max_tokens,
             activation_id=_ACT_IDS[activation],
             apply_router_weight_on_input=1 if apply_router_weight_on_input else 0,
-            weight_format=_WFMT_IDS[fmt],
+            weight_format=_WFMT_IDS[gu_fmt],
+            **role_fmt_kwargs,
             swiglu_alpha=float(swiglu_alpha),
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
             core_ids=core_ids,
@@ -381,7 +433,8 @@ class CpuMoeExecutor:
             )
             return ptrs, (H, I)
 
-        if fmt in _GGUF_W4A8_FORMATS:
+        gu_fmt, dn_fmt = _role_formats(fmt)
+        if gu_fmt in _GGUF_W4A8_FORMATS or dn_fmt in _GGUF_W4A8_FORMATS:
             return self._resolve_gguf_banks(banks, fmt)
 
         if fmt == "mxfp4_triton":
