@@ -173,6 +173,31 @@ def test_prefetch_range_is_page_aligned():
     assert lo2 == 4096 * 9 and hi2 == 4096 * 10
 
 
+def test_prefetch_skips_pinned_rows(monkeypatch, tmp_path):
+    from freetoken.moe.expert_source import MmapExpertSource
+
+    E, H, I = 4, 64, 32
+    _repack(monkeypatch, _fused_tensors(1, E, H, I), tmp_path)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    source = MmapExpertSource.open(str(tmp_path), pin_plan={0: [1]})
+    seen = []
+    monkeypatch.setattr(
+        MmapExpertSource,
+        "_willneed",
+        staticmethod(lambda mm, loc, start, end: seen.append((start, end))),
+    )
+    source.prefetch(0, [0, 1, 2])
+    # the whole-layer prefill copy reads the mmap views, so the pinned expert stays
+    # in: one merged run per role
+    assert seen == [(0, 2), (0, 2)]
+    seen.clear()
+    source.prefetch(0, [0, 1, 2], include_pinned=False)
+    # decode paths serve the pinned row from RAM: its range is skipped, and the
+    # remaining experts break into one run per gap, per role
+    assert seen == [(0, 0), (2, 2), (0, 0), (2, 2)]
+    source.close()
+
+
 def test_default_store_dir_maps_a_gguf_file(tmp_path):
     model = tmp_path / "m.gguf"
     model.write_bytes(b"")
@@ -260,6 +285,66 @@ def test_mmap_residency_stages_decode_and_allows_prefill_overlap(monkeypatch):
     cache.copy_missing()
     assert torch.equal(cache.bank_caches["gate_up"][:4], gu)
     assert torch.equal(cache.bank_caches["down"][:4], dn)
+
+
+def test_staged_copy_prefetches_the_current_layer_misses():
+    """I: the staged copy knows the misses before the fill, so it WILLNEEDs them first."""
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    class _Source:
+        def __init__(self, resident, views):
+            self.resident = resident
+            self.views = views
+            self.prefetches = []
+
+        def warm_row(self, layer, role, expert):
+            return self.views[role][layer][expert]
+
+        def read_rows_into(self, layer, role, experts, dst):
+            for i, e in enumerate(experts):
+                dst[i].copy_(self.views[role][layer][int(e)])
+            return 0
+
+        def prefetch(self, layer, experts, *, include_pinned=True):
+            self.prefetches.append((layer, list(experts), include_pinned))
+
+    gu = torch.arange(4 * 3 * 5, dtype=torch.float32).reshape(4, 3, 5)
+    dn = torch.arange(4 * 2 * 7, dtype=torch.float32).reshape(4, 2, 7) + 1000
+    views = {"gate_up": [gu], "down": [dn]}
+
+    def _misses(source):
+        cache = OffloadMoeCache(
+            num_layers=1, num_experts=4, cache_size=8, device=torch.device("cpu"),
+            quant_format="bf16", prefill_overlap=True,
+        )
+        cache.set_bank_sources(views, layer_residency=["mmap"], expert_source=source)
+        cache.num_indices.fill_(2)
+        cache.evict_slots[:2] = torch.tensor([5, 4], dtype=torch.int32)
+        cache.src_indices[:2] = torch.tensor([3, 1], dtype=torch.int32)
+        cache._pending_src_layer = 0
+        cache._pending_whole_layer = False
+        return cache
+
+    pageable = _Source(False, views)
+    _misses(pageable).copy_missing()
+    # the misses are WILLNEEDed up front, skipping rows the pin buffer serves
+    assert pageable.prefetches == [(0, [3, 1], False)]
+
+    pinned = _Source(True, views)
+    _misses(pinned).copy_missing()
+    # a resident source never prefetches
+    assert pinned.prefetches == []
+
+    off = _Source(False, views)
+    cache = _misses(off)
+    cache.staged_miss_prefetch = False
+    cache.copy_missing()
+    assert off.prefetches == []
+    assert torch.equal(cache.bank_caches["gate_up"][5], gu[3])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -400,7 +485,10 @@ def test_finish_mmap_source_keeps_graphs_for_cpu_decode():
     """D: pure-CPU decode over mmap is graph-capturable; staged GPU decode is not."""
     from freetoken.engine.engine import _finish_mmap_source
 
-    cfg = SimpleNamespace(cuda_graph_max_bs=8, cuda_graph_bs=[1, 2, 4, 8], expert_usage_file=None)
+    cfg = SimpleNamespace(
+        cuda_graph_max_bs=8, cuda_graph_bs=[1, 2, 4, 8], expert_usage_file=None,
+        expert_prefetch=None,
+    )
     _finish_mmap_source(cfg, SimpleNamespace(decode_target="cpu"))
     assert cfg.cuda_graph_max_bs == 8
     assert cfg.cuda_graph_bs == [1, 2, 4, 8]
@@ -408,6 +496,47 @@ def test_finish_mmap_source_keeps_graphs_for_cpu_decode():
     _finish_mmap_source(cfg, SimpleNamespace(decode_target="gpu"))
     assert cfg.cuda_graph_max_bs == 0
     assert cfg.cuda_graph_bs == []
+
+
+def test_finish_mmap_source_resolves_the_prefetch_depth(tmp_path, monkeypatch):
+    """I/N: --expert-prefetch > FREETOKEN_EXPERT_PREFETCH > 4; 0 disables the plan."""
+    from freetoken.engine.engine import _finish_mmap_source
+    from freetoken.moe.usage import UsageData
+
+    usage = UsageData(counts=[[3, 0, 2, 1]])  # rank: 0, 2, 3, 1
+    path = tmp_path / "usage.json"
+    usage.save(str(path))
+
+    class _Cache:
+        decode_target = "gpu"
+        usage_prefetch = None
+        staged_miss_prefetch = True
+
+    def _cfg(prefetch=None):
+        return SimpleNamespace(
+            cuda_graph_max_bs=0, cuda_graph_bs=[], expert_usage_file=str(path),
+            expert_prefetch=prefetch,
+        )
+
+    monkeypatch.setenv("FREETOKEN_EXPERT_PREFETCH", "2")
+    cache = _Cache()
+    _finish_mmap_source(_cfg(), cache)
+    assert cache.usage_prefetch == [[0, 2]]
+    assert cache.staged_miss_prefetch is True
+
+    cache = _Cache()
+    _finish_mmap_source(_cfg(1), cache)
+    assert cache.usage_prefetch == [[0]]
+
+    cache = _Cache()
+    _finish_mmap_source(_cfg(0), cache)
+    assert cache.usage_prefetch is None
+    assert cache.staged_miss_prefetch is False
+
+    monkeypatch.delenv("FREETOKEN_EXPERT_PREFETCH")
+    cache = _Cache()
+    _finish_mmap_source(_cfg(), cache)
+    assert cache.usage_prefetch == [[0, 2, 3, 1]]
 
 
 def test_select_expert_source_auto_prefers_mmap_over_budget(monkeypatch, tmp_path):
@@ -458,6 +587,7 @@ def test_parse_args_exposes_the_expert_flags(monkeypatch):
             "--expert-warm-file", "/tmp/w.json",
             "--expert-pin-budget", "4",
             "--expert-warm",
+            "--expert-prefetch", "16",
             "--moe-collect-stats",
         ])
     assert args.expert_source == "mmap"
@@ -467,6 +597,7 @@ def test_parse_args_exposes_the_expert_flags(monkeypatch):
     assert args.expert_pin_budget == 4.0
     assert args.expert_pin_fraction is None
     assert args.expert_warm is True
+    assert args.expert_prefetch == 16
     assert args.moe_collect_stats is True
 
 

@@ -73,6 +73,11 @@ class EngineConfig:
     # pages are resident (page cache = warm tier). Cut from ~15 min of 4 KiB faults to a
     # one-off sequential read; FREETOKEN_EXPERT_WARM=1 is the env fallback.
     expert_warm: bool = False
+    # --expert-prefetch: with an mmap source and a usage file, how many of each layer's
+    # top experts (by usage rank) to MADV_WILLNEED one layer ahead of decode. None =
+    # the FREETOKEN_EXPERT_PREFETCH env, else 4; 0 disables all prefetch (the plan and
+    # the staged copy's same-layer miss WILLNEED).
+    expert_prefetch: int | None = None
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

@@ -36,12 +36,12 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
 | F | Seed the warm/pin set from the REAP top-384 JSON (no calibration run needed) | Med-High | S-M | Med |
 | G | Run `ft experts stats` + `--expert-usage-file` (+ `--expert-pin-budget`) | Med | S to run / S to wire | Low |
 | H | Make staged decode CUDA-graph-capturable | Med-High | L | High |
-| I | Tune `FREETOKEN_EXPERT_PREFETCH`, prefetch same-layer routed experts | Med | S | Low |
+| I | Tune `FREETOKEN_EXPERT_PREFETCH`, prefetch same-layer routed experts (implemented) | Med | S | Low |
 | J | Usage-ordered repack (hot experts contiguous per layer) | Med | M | Low |
 | K | `cudaHostRegister` the warm mmap ranges instead of copying to anonymous pinned | Med | L | High |
 | L | Remove the default `MADV_RANDOM` (or make it policy) | Med (moot with A) | S | Low |
 | M | Add a microbenchmark harness so ring/size/usage changes get real A/B numbers (implemented) | Enables all | S-M | None |
-| N | Surface the `FREETOKEN_EXPERT_*` knobs as flags and warn (not info) when `auto` picks mmap | Low | S | None |
+| N | Surface the `FREETOKEN_EXPERT_*` knobs as flags and warn (not info) when `auto` picks mmap (partially: `--expert-prefetch` + the warning) | Low | S | None |
 
 `Impact` is on this model's slowness, `Effort` is S (< half day), M (1-2 days), L (3+ days).
 
@@ -69,10 +69,11 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
   and the allocated ring cannot drift.
 - **M - implemented.** `benchmarks/bench_expert_store.py` microbenchmarks, without a model
   load:
-  - the store read paths (`mmap_random`, `willneed`, `pread_whole`, `o_direct`) cold/warm,
-    as MiB/s and ms/expert;
+  - the store read paths (`mmap_random`, `willneed`, `pread_whole`, `pread_prefetch`,
+    `o_direct`) cold/warm, as MiB/s and ms/expert;
   - `_copy_missing_staged` swept over ring rows x miss count, with `--legacy` timing the
-    pre-C loop for a direct A/B;
+    pre-C loop and `--no-prefetch` timing the same-layer-prefetch-off loop (same
+    invocation, interleaved), both also under `--cold`;
   - a per-token / per-1000-token-prefill projection from the measured whole-expert reads.
   It synthesizes a tiny store when `--store` is omitted, so it runs anywhere.
 - **F - implemented.** `--expert-warm-file` (`FREETOKEN_EXPERT_WARM_FILE`) takes a
@@ -128,6 +129,37 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
   without the setter falls back to the old per-page-fault path. Covered by
   `tests/moe/test_cpu_moe_gguf_quants.py` (CPU-over-mmap vs GPU on the singles and
   composites) and `tests/moe/test_expert_store.py` (source selection + graph policy).
+- **I - implemented (same-layer prefetch + depth flag; N's flag/warning folded in).**
+  The staged copy already learns its misses with the one D2H read, so a pageable source
+  is now `MADV_WILLNEED`ed for every miss *before* the first ring pread, letting the
+  kernel's readahead overlap the per-expert reads instead of issuing them cold and
+  serially (`_copy_missing_staged` -> `source.prefetch(layer, misses,
+  include_pinned=False)`). `include_pinned=False` also applies to the next-layer usage
+  plan: pinned rows are served from the pin buffer, so WILLNEEDing their pages would
+  only refill the page cache with pages nothing reads (the "F caveat" mechanism in
+  miniature) - only the whole-layer prefill copy keeps the default, because it reads
+  the mmap views rather than the pins. The next-layer depth is now `--expert-prefetch N`
+  (flag > `FREETOKEN_EXPERT_PREFETCH` env > default 4), and **0 disables all prefetch**
+  (the plan and the same-layer miss WILLNEED together); the old env read had a
+  `max(1, ...)` clamp, so 0 silently meant 1 and there was no way to turn prefetch off.
+  Covered by `tests/moe/test_expert_store.py` (same-layer call + pinned skip + depth
+  resolution + flag parsing). Measured on this host against the real store (ring 8,
+  interleaved on/off via the bench's new `--no-prefetch` column, 11 reps):
+  warm 8 misses +~0.01 ms, 32 +~0.27 ms, 128 +~0.29 ms, 512 **-0.85 ms** (readahead
+  ahead of the preads over a whole layer); best-effort-cold 32 +~0.5 ms, 128 +~1.0 ms.
+  Read-path A/B agrees: `pread_prefetch` vs `pread_whole` is within noise cold
+  (1.133 vs 1.148 ms/expert at 32 experts) and warm (0.171 vs 0.216). Verdict: on this
+  NVMe a whole-expert buffered pread already reaches drive bandwidth, so the same-layer
+  WILLNEED is a wash-to-slightly-negative - kept on by default (decode-scale cost is
+  noise, and it should pay on higher-latency/colder storage), with `--expert-prefetch 0`
+  as the A/B kill switch for a served workload. Do not raise the *next-layer* depth
+  without a served A/B either; the flag exists so that A/B is reproducible.
+- **N - partially implemented (the parts I needs).** `--expert-prefetch` surfaces the
+  depth; the mmap auto-pick that disables decode CUDA graphs now logs a **warning**
+  (was info) naming the `--moe-strategy cpu` remedy, so a silently-eager default boot is
+  visible (`engine._finish_mmap_source`). `FREETOKEN_EXPERT_RING_ROWS` stays env-only
+  deliberately: the bench measured the default 8 fastest, so a flag would only invite
+  unhelpful tuning.
 
 Local C A/B against the real store (`layer-000`, `gate_up`, cache_size 512, ring rows 8,
 `--legacy`, page-warm, 21 reps). Only the chunked cases move; a single-chunk layer is
@@ -397,6 +429,9 @@ non-MoE work and only run MoE eagerly; or move the miss list to a graph-safe pat
 pinned-mirror read + captureable copy descriptors). Long-term and risky; revisit after D.
 
 ### I. Prefetch tuning / same-layer prefetch - Impact Med, Effort S
+_(implemented, see Status: same-layer miss WILLNEED before the ring fill, pinned rows
+skipped, next-layer depth via `--expert-prefetch` with 0 = all prefetch off; measured a
+wash on this NVMe, so the flag doubles as the kill switch for a served A/B)_
 `FREETOKEN_EXPERT_PREFETCH` defaults to 4 (`engine/engine.py:1501`) and only fires with a usage
 file. Once A exists, prefetch the *current* layer's `src_ids` ranges (they are known before the
 copy) and consider a larger next-layer depth. Cheap to A/B.
@@ -527,14 +562,18 @@ surfaces:
    _A done; L left as follow-up (moot for the fixed paths)._
 2. B (startup page-cache warm) - first token and prefill. _Done._
 3. C (batched staged copy, one sync/layer) + I (current-layer prefetch) + N (flags/warning so
-   the A/B runs are reproducible). _C done; I and N remain._
+   the A/B runs are reproducible). _C, I and N's flag+warning are done. I measured as a
+   wash-to-slightly-negative on this NVMe (see Status): same-layer prefetch is on by default
+   with `--expert-prefetch 0` as the kill switch._
 4. F (REAP-seeded warm set) or G (stats) - residency/prefetch. _F done
    (`--expert-warm-file`); G's store-flag forwarding + test done, the eager calibration run
    is still eager (until it runs on cpu/hybrid over the store, which D now enables)._
 5. E + D (composite CPU ext, then CPU/hybrid over the mmap store) - the big architectural win.
    _E and D done (plus bench-profile entries): `--moe-strategy cpu`/`hybrid` reads the mmap
    store directly with per-routed-expert prefetch. Prefill still streams whole layers._
-6. H, J, K as follow-ups.
+6. J, then H, then K as follow-ups (J compounds with the same usage file I now consumes;
+   H only pays on staged GPU decode, which `--moe-strategy cpu` avoids entirely; K last,
+   per its own risk notes).
 
 M (the `benchmarks/bench_expert_store.py` harness) is the measurement gate for all of the
 above; run it before and after any ring/source policy change.
@@ -606,6 +645,12 @@ See `docs/mmap-tiering-performance.md` for the full status and numbers.
   floor is handled by `_cpu_moe.set_mmap_prefetch`, which `MADV_WILLNEED`s each routed
   expert's gate_up/down range before the pool computes it. Prefill still streams whole layers
   into the GPU slot cache, so keep `--expert-warm` (or a small pin); H (graph-capturable staged
-  decode), I (prefetch tuning), J (repack ordering), K (`cudaHostRegister`) and L (drop
-  `MADV_RANDOM`) remain as follow-ups.
+  decode), J (repack ordering) and K (`cudaHostRegister`) remain as follow-ups, and L stays
+  moot (A's `pread`/`WILLNEED` paths do not depend on the `MADV_RANDOM` default, and
+  `MADV_WILLNEED` ignores the VMA's random policy, so I composes with it).
+- **Same-layer prefetch + the depth flag (I, done; N's flag/warning folded in):** the staged
+  copy `MADV_WILLNEED`s its misses before the ring fill (pinned rows skipped), the usage-ranked
+  next-layer depth is `--expert-prefetch N` (flag > `FREETOKEN_EXPERT_PREFETCH` > 4, and 0
+  disables all prefetch), and the mmap graph-disable is now a warning, not an info. Measured a
+  wash on this NVMe (see Status); the flag doubles as the A/B kill switch.
 

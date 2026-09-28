@@ -1522,6 +1522,13 @@ def _resolve_expert_pin_budget(config: EngineConfig, *, reserved: int, method=No
     return max(0, want - ring_bytes)
 
 
+def _resolve_expert_prefetch(config: EngineConfig) -> int:
+    """Next-layer usage-ranked prefetch depth: flag > env > 4, clamped at >= 0."""
+    if config.expert_prefetch is not None:
+        return max(0, int(config.expert_prefetch))
+    return max(0, int(os.environ.get("FREETOKEN_EXPERT_PREFETCH", "4")))
+
+
 def _finish_mmap_source(config: EngineConfig, cache) -> None:
     """Disable decode CUDA graphs for the staged H2D path and attach the prefetch plan.
 
@@ -1533,18 +1540,25 @@ def _finish_mmap_source(config: EngineConfig, cache) -> None:
     """
     from freetoken.moe.usage import load_usage, prefetch_plan
 
+    prefetch_depth = _resolve_expert_prefetch(config)
+    # 0 is a coherent "no prefetch at all": neither the next-layer usage plan nor the
+    # staged copy's same-layer miss WILLNEED
+    cache.staged_miss_prefetch = prefetch_depth > 0
     if cache.decode_target != "cpu":
         if config.cuda_graph_max_bs != 0:
-            logger.info_rank0("mmap expert source: disabling CUDA graphs (staged H2D is host-driven)")
+            logger.warning_rank0(
+                "mmap expert source: staged H2D decode is host-driven, so decode CUDA "
+                "graphs are disabled (--moe-strategy cpu decodes over the store with "
+                "graphs on)"
+            )
         object.__setattr__(config, "cuda_graph_bs", [])
         object.__setattr__(config, "cuda_graph_max_bs", 0)
     if config.expert_usage_file:
         usage = load_usage(config.expert_usage_file)
-        if usage is not None:
-            top_n = max(1, int(os.environ.get("FREETOKEN_EXPERT_PREFETCH", "4")))
-            cache.usage_prefetch = prefetch_plan(usage, top_n)
+        if usage is not None and prefetch_depth > 0:
+            cache.usage_prefetch = prefetch_plan(usage, prefetch_depth)
             logger.info_rank0(
-                f"mmap expert source: prefetching top-{top_n} experts per layer from "
+                f"mmap expert source: prefetching top-{prefetch_depth} experts per layer from "
                 f"{config.expert_usage_file}"
             )
 
@@ -1594,6 +1608,7 @@ _DENSE_MOE_SETTINGS = {
     "expert_pin_budget": None,
     "expert_pin_fraction": None,
     "expert_warm_file": None,
+    "expert_prefetch": None,
     "moe_collect_stats": False,
 }
 

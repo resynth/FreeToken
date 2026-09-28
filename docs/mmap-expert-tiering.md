@@ -114,7 +114,14 @@ Two implementations:
   views, not the pins, so a large pin evicts the page cache prefill needs and can make serving
   much slower on a RAM-tight host; size it with `--expert-pin-fraction` or start with no pin.
 - **Prefetch**: `madvise(MADV_WILLNEED)` the next layer's likely experts (from the usage
-  file) before the current layer's GEMM, so prefill overlaps I/O with compute.
+  file, top `--expert-prefetch` per layer) before the current layer's GEMM, so prefill
+  overlaps I/O with compute. Independently of any usage file, the staged decode copy
+  `MADV_WILLNEED`s the *current* layer's misses before the ring fill (they are known
+  from the single D2H read); pinned rows are skipped in both cases - the pin buffer
+  serves them, and refilling their pages would only evict ones the page cache needs.
+  `--expert-prefetch 0` disables all prefetch; measured on the box's NVMe the
+  same-layer WILLNEED is a wash (whole-expert `pread` already reaches drive
+  bandwidth), so 0 is the A/B switch for a served workload.
 
 ### 5. Config / flags
 - `--expert-source {auto,pinned,mmap}` (default `auto`: pinned if it fits, else mmap).
@@ -133,6 +140,11 @@ Two implementations:
   double-buffered, so the pinned carve-out is `2 * rows * expert_bytes`. Still env-only; the
   default measured fastest in `benchmarks/bench_expert_store.py`, so change it only with that
   bench's numbers.
+- `--expert-prefetch <N>` (default 4, `FREETOKEN_EXPERT_PREFETCH` env fallback): with a
+  usage file, `MADV_WILLNEED` the top-N experts (by usage rank) of the next layer ahead
+  of its GEMM. `0` disables all prefetch (the next-layer plan and the staged copy's
+  same-layer miss WILLNEED); 0 also works as the A/B kill switch for the same-layer
+  prefetch, which measured as a wash on this host's NVMe.
 - `--expert-store <dir>` (default: alongside the checkpoint, or a cache dir).
 - `_check_pin_budget` no longer errors for offload; it selects the mmap source instead
   (keeping the error only for `--expert-source pinned`, and for models with no store).
@@ -263,12 +275,13 @@ Behaviour to expect:
 - **`--moe-cache-auto` sizes the GPU slot cache from free VRAM.** On a 16 GiB card with this
   model it resolved `moe_cache_size=2232` and left ~1.5 GiB free. If decode OOMs, pass an
   explicit `--moe-cache-size` (e.g. 1536) instead.
-- **No usage file -> no explicit pinning or prefetch**: the page cache and LRU only. Run
-  `ft experts stats --model <model.gguf> --calib <text> --expert-source mmap --expert-store
-  <store> --expert-warm --ple-source <fp8-ple>` to write one, then add `--expert-usage-file
-  <usage.json>`. For a zero-calibration warm set, pass `--expert-warm-file <reap-top-k.json>`
-  instead: it pins the retained experts per layer, budget-capped, and leaves the rest to the
-  page cache.
+- **No usage file -> no explicit pinning and no next-layer prefetch**: the page cache and
+  LRU only, plus the staged copy's same-layer miss WILLNEED (which needs no plan - it
+  knows the misses). Run `ft experts stats --model <model.gguf> --calib <text>
+  --expert-source mmap --expert-store <store> --expert-warm --ple-source <fp8-ple>` to
+  write one, then add `--expert-usage-file <usage.json>`. For a zero-calibration warm set,
+  pass `--expert-warm-file <reap-top-k.json>` instead: it pins the retained experts per
+  layer, budget-capped, and leaves the rest to the page cache.
 - **A large pin can be slower than no pin on a RAM-tight host**: the whole-layer prefill copy
   reads the mmap views, not the pins, so a ~44 GiB REAP pin evicted the page cache prefill
   needed on a 62 GiB host (prefill fell to 0.10-0.36 tok/s). Prefer `--expert-warm` with no pin

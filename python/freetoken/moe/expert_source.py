@@ -72,7 +72,10 @@ class ExpertSource(Protocol):
         """Copy ``experts[i]``'s row into ``dst[i]``; return the count served from pins."""
         ...
 
-    def prefetch(self, layer: int, experts: Sequence[int]) -> None: ...
+    def prefetch(
+        self, layer: int, experts: Sequence[int], *, include_pinned: bool = True
+    ) -> None:
+        ...
 
     def close(self) -> None: ...
 
@@ -115,7 +118,9 @@ class PinnedExpertSource:
             dst[i].copy_(rows[expert])
         return len(ids)
 
-    def prefetch(self, layer: int, experts: Sequence[int]) -> None:
+    def prefetch(
+        self, layer: int, experts: Sequence[int], *, include_pinned: bool = True
+    ) -> None:
         return
 
     def close(self) -> None:
@@ -299,16 +304,35 @@ class MmapExpertSource:
             _preadv_full(fd, mv[i * row_nbytes : (i + 1) * row_nbytes], loc.expert_offset(expert))
         return pinned
 
-    def prefetch(self, layer: int, experts: Sequence[int]) -> None:
-        """``MADV_WILLNEED`` the byte ranges of ``experts`` (merged runs)."""
+    def prefetch(
+        self, layer: int, experts: Sequence[int], *, include_pinned: bool = True
+    ) -> None:
+        """``MADV_WILLNEED`` the byte ranges of ``experts`` (merged runs).
+
+        ``include_pinned=False`` skips experts the pinned warm subset already serves:
+        their mapped pages are read by nobody on the decode paths, and WILLNEEDing them
+        would refill the page cache with pages that only evict useful ones. The
+        whole-layer prefill copy reads the mmap views (not the pins), so it keeps the
+        default.
+        """
         if not experts or self._closed:
             return
-        ordered = sorted({int(e) for e in experts if 0 <= int(e) < self.index.num_experts})
+        wanted = {int(e) for e in experts if 0 <= int(e) < self.index.num_experts}
+        if not wanted:
+            return
         for role in self.roles:
+            ids = wanted
+            if not include_pinned:
+                pin = self._pins.get((layer, role))
+                if pin is not None:
+                    ids = wanted - pin.slot_of.keys()
+            if not ids:
+                continue
             loc = self.index.location(layer, role)
             mm = self._mmap(layer, role)
             if not hasattr(mm, "madvise"):
                 return
+            ordered = sorted(ids)
             run_start = ordered[0]
             prev = ordered[0]
             for e in ordered[1:]:

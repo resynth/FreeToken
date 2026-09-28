@@ -6,8 +6,10 @@ Two sections, both against a repacked expert store (`ft experts repack`):
    mmap tier can use:
    - `mmap_random`  copy the mmap view row under `MADV_RANDOM` (the per-4-KiB-fault path),
    - `willneed`     `MADV_WILLNEED` the expert ranges first, then the mmap copy,
-   - `pread_whole`  one buffered whole-expert `preadv` per miss (`ExpertSource.read_rows_into`),
-   - `o_direct`     whole experts via O_DIRECT 256-KiB chunks (aligned extents only).
+    - `pread_whole`  one buffered whole-expert `preadv` per miss (`ExpertSource.read_rows_into`),
+    - `pread_prefetch` `MADV_WILLNEED` every miss up front, then `pread_whole` (what
+                     `_copy_missing_staged` does now; A/B against `pread_whole`),
+    - `o_direct`     whole experts via O_DIRECT 256-KiB chunks (aligned extents only).
    Cold (best-effort page-cache drop) and warm are both reported as MiB/s and ms/expert.
 
 2. **Staged copy** -- `OffloadMoeCache._copy_missing_staged` over the store's real bank
@@ -72,6 +74,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--legacy", action="store_true",
                    help="staged section: also time the pre-C copy loop (two syncs, per-chunk "
                         "stream drain) for an A/B")
+    p.add_argument("--no-prefetch", action="store_true",
+                   help="staged section: also time the copy with the same-layer miss "
+                        "WILLNEED disabled, as an A/B column (the default column has "
+                        "it on)")
     return p.parse_args()
 
 
@@ -225,6 +231,12 @@ def bench_read_paths(store_dir: str, args: argparse.Namespace) -> dict[str, floa
     def pread_whole() -> None:
         source.read_rows_into(args.layer, args.role, ids, dst)
 
+    def pread_prefetch() -> None:
+        # what _copy_missing_staged does now: WILLNEED every miss up front, then the
+        # buffered whole-expert preads hit pages already in flight / resident
+        source.prefetch(args.layer, ids)
+        source.read_rows_into(args.layer, args.role, ids, dst)
+
     reader = _ODirectReader(bank_path, loc)
     odirect_ok = reader.fd >= 0 and reader.aligned(ids)
 
@@ -235,6 +247,7 @@ def bench_read_paths(store_dir: str, args: argparse.Namespace) -> dict[str, floa
         ("mmap_random", mmap_copy),
         ("willneed", willneed_copy),
         ("pread_whole", pread_whole),
+        ("pread_prefetch", pread_prefetch),
         ("o_direct", o_direct if odirect_ok else None),
     ]
 
@@ -336,6 +349,8 @@ def bench_staged(store_dir: str, args: argparse.Namespace, device: torch.device)
     columns = f"{'ring_rows':>9} {'misses':>7} {'new ms':>9} {'MiB/s':>9}"
     if args.legacy:
         columns += f" {'legacy ms':>10} {'legacy MiB/s':>13} {'speedup':>8}"
+    if args.no_prefetch:
+        columns += f" {'no-prefetch ms':>15} {'prefetch cost':>13}"
     print(columns)
     print("-" * len(columns))
 
@@ -351,6 +366,19 @@ def bench_staged(store_dir: str, args: argparse.Namespace, device: torch.device)
             layer_residency=["mmap"] * layers,
             expert_source=source,
         )
+        cold_before = None
+        if args.cold:
+            # best-effort drop of layer 0's banks (madvise DONTNEED + fadvise), the
+            # same regime the read section's --cold produces
+            def cold_before() -> None:  # noqa: E306
+                for role in source.roles:
+                    mm = source._mmap(0, role)
+                    if hasattr(mm, "madvise"):
+                        try:
+                            mm.madvise(mmap.MADV_DONTNEED)
+                        except (OSError, ValueError):
+                            pass
+                    drop_page_cache(source._path(0, role), args.aggressive_drop)
         for misses in args.miss_counts:
             misses = min(misses, index.num_experts, cache_size)
             cache.evict_slots[:misses] = torch.arange(misses, dtype=torch.int32, device=device)
@@ -370,13 +398,23 @@ def bench_staged(store_dir: str, args: argparse.Namespace, device: torch.device)
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
 
-            ms = _time(run, args.repeat) * 1e3
+            def run_no_prefetch() -> None:
+                cache.staged_miss_prefetch = False
+                try:
+                    run()
+                finally:
+                    cache.staged_miss_prefetch = True
+
+            ms = _time(run, args.repeat, before=cold_before) * 1e3
             moved = misses * index.expert_bytes() / MiB
             line = f"{ring_rows:>9} {misses:>7} {ms:>9.3f} {moved / (ms / 1e3):>9.1f}"
             if args.legacy:
-                ms_legacy = _time(run_legacy, args.repeat) * 1e3
+                ms_legacy = _time(run_legacy, args.repeat, before=cold_before) * 1e3
                 line += (f" {ms_legacy:>10.3f} {moved / (ms_legacy / 1e3):>13.1f} "
                          f"{ms_legacy / ms:>7.2f}x")
+            if args.no_prefetch:
+                ms_off = _time(run_no_prefetch, args.repeat, before=cold_before) * 1e3
+                line += f" {ms_off:>15.3f} {ms - ms_off:>12.3f}m"
             print(line, flush=True)
         del cache
         source.close()

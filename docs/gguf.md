@@ -137,8 +137,9 @@ pin with `--expert-pin-fraction`; to calibrate, run `ft experts stats --model <g
     (`offload_cache.py:_copy_missing_staged`). The per-row Python loop survives only as the
     fallback for a source without `read_rows_into`. Read-path and copy A/B numbers:
     `benchmarks/bench_expert_store.py` (see `mmap-tiering-performance.md` C/M).
-  - An auto-selected mmap source disables decode CUDA graphs with only an info log
-    (`engine._finish_mmap_source`); warn explicitly when `--expert-source auto` picks mmap.
+  - An auto-selected mmap source disables decode CUDA graphs; that boot used to log only
+    an info line, but it is now a **warning** naming the `--moe-strategy cpu` remedy
+    (`engine._finish_mmap_source`).
   - `FREETOKEN_EXPERT_RING_ROWS` is read once (`offload_cache.staging_ring_rows()`), and
     `_resolve_expert_pin_budget` carves out both staging buffers, so the budget and the
     allocated ring can no longer drift. Still env-only with no CLI flag, and the default 8
@@ -169,8 +170,12 @@ pin with `--expert-pin-fraction`; to calibrate, run `ft experts stats --model <g
   - `ft checkpoint` does not emit an expert store, and the engine checks the store's
     format/geometry but not its `fingerprint`/`source_path`, so a same-geometry store built
     from a different checkpoint is accepted silently.
-  - Prefetch depth (`FREETOKEN_EXPERT_PREFETCH`) and ring rows
-    (`FREETOKEN_EXPERT_RING_ROWS`) are env-only, with no CLI flags.
+- Prefetch depth is `--expert-prefetch N` (flag > `FREETOKEN_EXPERT_PREFETCH` env > default
+  4; 0 disables all prefetch - the next-layer usage plan and the staged copy's same-layer
+  miss WILLNEED together). It used to be env-only with a `max(1, ...)` clamp, so 0 silently
+  meant 1 and prefetch could not be turned off. Ring rows
+  (`FREETOKEN_EXPERT_RING_ROWS`) stay env-only deliberately: the bench measured the
+  default 8 fastest, so a flag would only invite unhelpful tuning.
 - `ft experts stats` now forwards `--expert-source` / `--expert-store` / `--expert-warm` and
   `--ple-source` / `--ple-backend` to the calibration model (a split GGUF's store is not at
   the default `<shard>.experts` path, and qwen4exp needs its external fp8 PLE table), and its

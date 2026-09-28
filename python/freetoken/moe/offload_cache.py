@@ -304,6 +304,9 @@ class OffloadMoeCache:
         self.expert_source = None
         # usage-ranked per-layer expert ids to MADV_WILLNEED one layer ahead (None = off)
         self.usage_prefetch: list[list[int]] | None = None
+        # whether the staged copy MADV_WILLNEEDs the current layer's misses before the
+        # ring fill; --expert-prefetch 0 turns it off with the plan (set by the engine)
+        self.staged_miss_prefetch = True
         self._staging_ready = False
         self._staging_ring: dict[str, list[torch.Tensor]] = {}
         self._staging_device: dict[str, list[torch.Tensor]] = {}
@@ -1182,7 +1185,8 @@ class OffloadMoeCache:
         """MADV_WILLNEED the next layer's usage-ranked experts before this layer's GEMM.
 
         Only the mmap source can prefetch; a pinned source is already resident. Host code,
-        never captured, so the mmap tier runs with CUDA graphs disabled.
+        never captured, so the mmap tier runs with CUDA graphs disabled. Pinned experts are
+        skipped: the pin buffer serves them, so their pages are not worth cache pressure.
         """
         source = self.expert_source
         plan = self.usage_prefetch
@@ -1190,7 +1194,7 @@ class OffloadMoeCache:
             return
         nxt = layer_id + 1
         if nxt < self.num_layers:
-            source.prefetch(nxt, plan[nxt])
+            source.prefetch(nxt, plan[nxt], include_pinned=False)
 
     def _ensure_staging(self) -> None:
         """Allocate the double-buffered pinned ring + device bounce per bank (never inside graph capture)."""
@@ -1250,18 +1254,30 @@ class OffloadMoeCache:
         """Resolve an LRU slot remap for an mmap-backed layer through the pinned ring.
 
         ``ensure_experts`` left ``src_indices`` (layer-local expert ids) and ``evict_slots``
-        (cache slots) on the device; one host sync reads both, the rows are staged from the
-        source (page cache or the pinned warm subset) into a double-buffered pinned ring,
-        and one H2D + device scatter per chunk lands them in the slot cache. The buffers
-        alternate so a chunk's copy can overlap the next chunk's host-side fill without a
-        per-chunk stream drain. Correct but host-synchronized, so staged decode is eager.
+        (cache slots) on the device; one host sync reads both, the miss ids are
+        ``MADV_WILLNEED``ed for a pageable source (so the readahead overlaps the ring
+        fill), and the rows are staged from the source (page cache or the pinned warm
+        subset) into a double-buffered pinned ring, where one H2D + device scatter per
+        chunk lands them in the slot cache. The buffers alternate so a chunk's copy can
+        overlap the next chunk's host-side fill without a per-chunk stream drain.
+        Correct but host-synchronized, so staged decode is eager.
         """
         n, src_ids = self._read_pending_staged()
         if n <= 0:
             return
+        source = self.expert_source
+        if (
+            source is not None
+            and self.staged_miss_prefetch
+            and not getattr(source, "resident", True)
+        ):
+            # WILLNEED every miss before the first pread so the ring fill finds pages
+            # already in flight instead of cold-reading one expert at a time. Pinned
+            # rows are served from RAM, so their ranges are skipped (refilling those
+            # pages would only evict ones the page cache needs).
+            source.prefetch(layer_id, src_ids, include_pinned=False)
         self._ensure_staging()
         evict = self.evict_slots[:n].long()
-        source = self.expert_source
         read_rows = getattr(source, "read_rows_into", None)
         cuda = self.device.type == "cuda"
         for role, (per_layer, cache) in zip(self.bank_schema, self.banks):

@@ -741,6 +741,20 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--expert-prefetch",
+        type=int,
+        default=ServerArgs.expert_prefetch,
+        metavar="N",
+        help=(
+            "With an mmap expert source, prefetch policy: N (default 4, or "
+            "FREETOKEN_EXPERT_PREFETCH when the flag is omitted) MADV_WILLNEEDs the "
+            "top-N experts (by usage rank) of the next layer ahead of decode; 0 "
+            "disables all prefetch (the plan and the staged copy's same-layer miss "
+            "prefetch)."
+        ),
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",
