@@ -700,6 +700,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--expert-warm-file",
+        default=ServerArgs.expert_warm_file,
+        help=(
+            "Retained-expert plan for the mmap source: a JSON object mapping layer -> "
+            "[expert ids] (e.g. a REAP top-K dump, such as "
+            "docs/qwen3.8-flash-next-top-384-experts-according-to-sh0wie.json). Those "
+            "experts are pinned per layer, budget-capped, with no calibration run. "
+            "--expert-usage-file, if also given, drives prefetch only. "
+            "FREETOKEN_EXPERT_WARM_FILE overrides."
+        ),
+    )
+
+    parser.add_argument(
         "--expert-pin-budget",
         type=float,
         default=ServerArgs.expert_pin_budget,

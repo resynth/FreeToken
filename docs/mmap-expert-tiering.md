@@ -93,6 +93,14 @@ Two implementations:
   `ft experts stats --model <gguf> --calib <text>` that writes a usage file consumed by
   `--expert-usage-file`. Absent a usage file, fall back to LRU (the page cache and slot cache
   already approximate it).
+- **Retained-expert prior**: `--expert-warm-file` takes a JSON `layer -> [expert ids]` plan
+  (e.g. a REAP top-K dump such as
+  `docs/qwen3.8-flash-next-top-384-experts-according-to-sh0wie.json`) and pins exactly those
+  experts per layer, budget-capped, with no calibration run. It carries no frequency
+  information, so it guarantees residency of the retained set rather than optimal ranking;
+  when both flags are given the warm file sets the pin plan and the usage file drives
+  prefetch. This is the cheapest way to seed the warm tier (F in
+  `mmap-tiering-performance.md`).
 - **Prefetch**: `madvise(MADV_WILLNEED)` the next layer's likely experts (from the usage
   file) before the current layer's GEMM, so prefill overlaps I/O with compute.
 
@@ -102,6 +110,10 @@ Two implementations:
   `_pin_budget_bytes() - ring_bytes`; the staging ring is pinned, so carve it out before
   sizing the top-K subset).
 - `--expert-usage-file <path>` (from `ft experts stats`).
+- `--expert-warm-file <path>` (`FREETOKEN_EXPERT_WARM_FILE`): a retained-expert plan, JSON
+  `layer -> [expert ids]` (e.g. a REAP top-K dump). Pins those experts per layer,
+  budget-capped, without a calibration run; `--expert-usage-file` still supplies the
+  prefetch ranking when both are given.
 - `--expert-warm` (`FREETOKEN_EXPERT_WARM=1`): sequentially read the whole store once at
   startup so the page cache is warm before the first request, instead of faulting experts
   in on demand. Opt-in because it is a one-off whole-store read (~15 s for 62 GiB here).
@@ -219,6 +231,8 @@ Behaviour to expect:
   explicit `--moe-cache-size` (e.g. 1536) instead.
 - **No usage file -> no explicit pinning or prefetch**: the page cache and LRU only. Run
   `ft experts stats --model <model.gguf> --calib <text>` to write one, then add
-  `--expert-usage-file <usage.json>`.
+  `--expert-usage-file <usage.json>`. For a zero-calibration warm set, pass
+  `--expert-warm-file <reap-top-k.json>` instead: it pins the retained experts per layer,
+  budget-capped, and leaves the rest to the page cache.
 - **`--expert-source auto` (default)** picks mmap when the banks exceed the pin budget and a
   store exists; without a store it fails with the `ft experts repack` command to run.

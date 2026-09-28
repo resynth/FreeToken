@@ -688,6 +688,7 @@ class Engine:
                     expert_source=expert_source_mode,
                     expert_store=config.expert_store,
                     expert_usage_file=config.expert_usage_file,
+                    expert_warm_file=config.expert_warm_file,
                     expert_pin_budget_bytes=pin_budget_bytes,
                     expert_warm=config.expert_warm,
                 )
@@ -744,6 +745,11 @@ class Engine:
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if banks.tier == "mmap":
             _finish_mmap_source(config, cache)
+        elif config.expert_warm_file:
+            logger.warning(
+                "--expert-warm-file only applies to the mmap expert source; the banks fit "
+                "the pin budget, so expert residency is unchanged"
+            )
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
@@ -1559,6 +1565,7 @@ _DENSE_MOE_SETTINGS = {
     "expert_usage_file": None,
     "expert_pin_budget": None,
     "expert_pin_fraction": None,
+    "expert_warm_file": None,
     "moe_collect_stats": False,
 }
 

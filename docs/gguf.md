@@ -52,8 +52,13 @@ Pass `--drop-ple` when the checkpoint carries its own `per_layer_token_embd.weig
 qwen4exp GGUFs do; ~28.8 GiB here) - the engine serves the fp8 table from `--ple-source`,
 so archiving the GGUF copy only wastes disk.
 An optional `ft experts stats` usage file pins the top experts per layer and prefetches
-them one layer ahead. Without that, an oversized model still stops with a clear error
-instead of OOM-crashing the host.
+them one layer ahead. A calibration-free alternative is `--expert-warm-file`, a retained
+expert plan (a JSON `layer -> [expert ids]`, e.g. the REAP top-K dump shipped as
+`docs/qwen3.8-flash-next-top-384-experts-according-to-sh0wie.json`): the listed experts are
+pinned per layer, budget-capped, and the rest fall back to the page cache. Both can be
+combined - the warm file sets the pin plan while the usage file still drives prefetch.
+Without either, an oversized model still stops with a clear error instead of OOM-crashing the
+host.
 
 ## Qwen3.8-Flash-Next (`qwen4exp`)
 
@@ -84,11 +89,14 @@ To serve the 512-expert IQ4_XS GGUF on a ~62 GiB host (banks exceed the pin budg
 ```
 ft experts repack <gguf> --out <store> --drop-ple
 ft serve --model <gguf> --ple-source Saren/Qwen3.8-Flash-Next-ple-table-fp8 \
-    --expert-source mmap --expert-store <store> --moe-cache-auto
+    --expert-source mmap --expert-store <store> --moe-cache-auto \
+    --expert-warm-file docs/qwen3.8-flash-next-top-384-experts-according-to-sh0wie.json
 ```
 See [mmap-expert-tiering.md](mmap-expert-tiering.md) "Running with the store": staged decode
-is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs, and an
-`--expert-usage-file` from `ft experts stats` adds the pinned warm subset and prefetch.
+is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs. The warm file
+pins the REAP-retained 384 experts per layer (45.7 GiB, inside the ~51 GiB pin budget) with
+no calibration run; an `--expert-usage-file` from `ft experts stats` can still be added for a
+ranked prefetch.
 
 ## Verification
 
@@ -132,7 +140,9 @@ is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs, 
   - Online per-`(layer, expert)` counters are not wired to `--moe-collect-stats`: the server
     path only accumulates `lru_stats` (miss rate), while the histogram needs
     `collect_decode_freq` set programmatically and has no dump endpoint, so
-    `--expert-usage-file` currently needs the offline `ft experts stats` pass.
+    `--expert-usage-file` currently needs the offline `ft experts stats` pass. A
+    calibration-free alternative is `--expert-warm-file`, but it only seeds residency (a
+    static retained set, no ranking and no prefetch).
   - The mmap store is native-GGUF only (`q4_0`/`q5_K`/`iq4_nl`/`iq4_xs` and composite tags)
     and requires contiguous expert layers; nvfp4/mxfp4/fp8-block and HF/FTW checkpoints keep
     the pinned path, and leading-dense expert layouts are rejected by the repack.

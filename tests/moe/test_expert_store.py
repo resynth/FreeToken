@@ -409,6 +409,7 @@ def test_parse_args_exposes_the_expert_flags(monkeypatch):
             "--expert-source", "mmap",
             "--expert-store", "/tmp/store",
             "--expert-usage-file", "/tmp/u.json",
+            "--expert-warm-file", "/tmp/w.json",
             "--expert-pin-budget", "4",
             "--expert-warm",
             "--moe-collect-stats",
@@ -416,6 +417,7 @@ def test_parse_args_exposes_the_expert_flags(monkeypatch):
     assert args.expert_source == "mmap"
     assert args.expert_store == "/tmp/store"
     assert args.expert_usage_file == "/tmp/u.json"
+    assert args.expert_warm_file == "/tmp/w.json"
     assert args.expert_pin_budget == 4.0
     assert args.expert_pin_fraction is None
     assert args.expert_warm is True
@@ -435,6 +437,47 @@ def test_select_expert_source_pinned_matches_the_fit(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "8")
     assert _select_expert_source(cfg, reserved=0) == "pinned"
+
+
+def test_store_warm_file_sets_the_pin_plan(monkeypatch, tmp_path):
+    from freetoken.moe.expert_banks import _store_expert_banks
+
+    E, H, I, L = 4, 64, 32, 2
+    _repack(monkeypatch, _fused_tensors(L, E, H, I), tmp_path)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    warm_file = tmp_path / "reap.json"
+    warm_file.write_text(json.dumps({"0": [3, 1], "1": [2]}))
+    cfg = SimpleNamespace(
+        num_moe_layers=L, num_experts=E, expert_quant="iq4_nl",
+        hidden_size=H, moe_intermediate_size=I,
+    )
+    banks = _store_expert_banks(
+        "m.gguf", cfg, store_dir=str(tmp_path), usage_file=None,
+        warm_file=str(warm_file), pin_budget_bytes=10**9,
+    )
+    source = banks.source
+    assert source.is_pinned_row(0, "gate_up", 3)
+    assert source.is_pinned_row(0, "down", 1)
+    assert source.is_pinned_row(1, "gate_up", 2)
+    assert not source.is_pinned_row(0, "gate_up", 0)
+    source.close()
+
+
+def test_store_warm_file_rejects_a_layer_out_of_range(monkeypatch, tmp_path):
+    from freetoken.moe.expert_banks import _store_expert_banks
+
+    _repack(monkeypatch, _fused_tensors(1, 2, 64, 32), tmp_path)
+    warm_file = tmp_path / "reap.json"
+    warm_file.write_text(json.dumps({"3": [0]}))
+    cfg = SimpleNamespace(
+        num_moe_layers=1, num_experts=2, expert_quant="iq4_nl",
+        hidden_size=64, moe_intermediate_size=32,
+    )
+    with pytest.raises(ValueError, match="MoE layers"):
+        _store_expert_banks(
+            "m.gguf", cfg, store_dir=str(tmp_path), usage_file=None,
+            warm_file=str(warm_file), pin_budget_bytes=10**9,
+        )
 
 
 def test_read_rows_into_matches_the_store(monkeypatch, tmp_path):

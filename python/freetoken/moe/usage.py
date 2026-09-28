@@ -12,12 +12,19 @@ is saved as a usage file and later consumed by ``--expert-usage-file``:
 
 Absent a usage file the policy is empty: no explicit pinning/prefetch, and the LRU slot
 cache plus the OS page cache approximate the same working set.
+
+A second, calibration-free source of pinning is a *retained-expert plan* loaded from
+``--expert-warm-file`` (:func:`load_warm_plan`, e.g. a REAP top-K JSON mapping
+``layer -> [expert ids]``). It carries no frequency information, so :func:`select_warm_pins`
+only seeds residency: it pins the listed experts under the pin budget and leaves the rest to
+the page cache. ``--expert-usage-file`` still supplies a ranked prefetch when both are given.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from freetoken.utils import init_logger
@@ -139,6 +146,91 @@ def select_pins(
             # keep pin order stable by rank (the append order above is already descending,
             # but the floor prefix + remainder suffix should read as one ranked list)
             pinned[layer].sort(key=lambda e: (-usage.counts[layer][e], e))
+    return pinned
+
+
+def load_warm_plan(path: str) -> dict[int, list[int]]:
+    """Load a per-layer retained-expert plan: ``{"<layer>": [expert ids...], ...}``.
+
+    This is the shape of a REAP top-K dump (the retained set of a REAPed sibling), not a
+    frequency ranking. The plan only seeds the pinned warm subset (``--expert-warm-file``);
+    pass a usage file with ``--expert-usage-file`` when a ranked prefetch is also wanted.
+    """
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path}: warm plan must be a JSON object of layer -> [expert ids]")
+    if doc.get("format") == USAGE_FORMAT:
+        raise ValueError(
+            f"{path}: this is an expert usage file; pass it with --expert-usage-file "
+            f"(or convert it to a layer -> [expert ids] warm plan)"
+        )
+    plan: dict[int, list[int]] = {}
+    for key, ids in doc.items():
+        try:
+            layer = int(key)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{path}: warm plan layer key must be an integer, got {key!r}") from exc
+        if not isinstance(ids, list):
+            raise ValueError(f"{path}: warm plan layer {layer} must be a list of expert ids")
+        try:
+            plan[layer] = [int(e) for e in ids]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{path}: warm plan layer {layer} holds a non-integer expert id") from exc
+    return plan
+
+
+def select_warm_pins(
+    plan: dict[int, Sequence[int]],
+    *,
+    num_layers: int,
+    num_experts: int,
+    expert_bytes: int,
+    budget_bytes: int,
+) -> dict[int, list[int]]:
+    """Pin the planned (retained) experts under ``budget_bytes``.
+
+    Uses the same per-layer floor as :func:`select_pins` (an even share of the budget per
+    layer, then any remainder spent across layers), but the plan has no ranking to spend the
+    remainder on, so leftover budget is left to the page cache. Ids out of range are
+    dropped. Returns ``{layer: [expert ids]}``.
+    """
+    if budget_bytes <= 0 or expert_bytes <= 0 or num_layers <= 0 or not plan:
+        return {}
+    per_layer_budget = budget_bytes // num_layers
+    floor_k = per_layer_budget // expert_bytes
+
+    planned: dict[int, list[int]] = {}
+    for layer in range(num_layers):
+        seen: set[int] = set()
+        ids: list[int] = []
+        for raw in plan.get(layer, ()):
+            expert = int(raw)
+            if 0 <= expert < num_experts and expert not in seen:
+                seen.add(expert)
+                ids.append(expert)
+        planned[layer] = ids
+
+    pinned: dict[int, list[int]] = {}
+    spent = 0
+    for layer in range(num_layers):
+        k = min(floor_k, len(planned[layer]))
+        pinned[layer] = planned[layer][:k]
+        spent += k * expert_bytes
+
+    remaining = budget_bytes - spent
+    taken = {layer: len(pinned[layer]) for layer in range(num_layers)}
+    progressed = True
+    while remaining >= expert_bytes and progressed:
+        progressed = False
+        for layer in range(num_layers):
+            if remaining < expert_bytes:
+                break
+            if taken[layer] < len(planned[layer]):
+                pinned[layer].append(planned[layer][taken[layer]])
+                taken[layer] += 1
+                remaining -= expert_bytes
+                progressed = True
     return pinned
 
 

@@ -65,6 +65,10 @@ class EngineConfig:
     expert_usage_file: str | None = None
     expert_pin_budget: float | None = None
     expert_pin_fraction: float | None = None
+    # Retained-expert plan (--expert-warm-file): a JSON object mapping layer -> [expert ids],
+    # e.g. a REAP top-K dump. Pins exactly those experts per layer (budget-capped) without a
+    # calibration run. Independent of expert_usage_file, which still drives prefetch.
+    expert_warm_file: str | None = None
     # --expert-warm: before serving, sequentially read the whole mmap store once so its
     # pages are resident (page cache = warm tier). Cut from ~15 min of 4 KiB faults to a
     # one-off sequential read; FREETOKEN_EXPERT_WARM=1 is the env fallback.

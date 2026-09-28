@@ -312,13 +312,14 @@ def _store_expert_banks(
     store_dir: str,
     usage_file: str | None,
     pin_budget_bytes: int,
+    warm_file: str | None = None,
     warm: bool = False,
 ) -> ExpertBanks:
-    """Load an expert store through the mmap source, optionally pinning a usage-ranked subset."""
+    """Load an expert store through the mmap source, optionally pinning a ranked or planned subset."""
     from freetoken.moe.expert_source import MmapExpertSource
     from freetoken.moe.expert_store import ExpertStoreIndex, is_expert_store
     from freetoken.moe.host_banks import HostResidency
-    from freetoken.moe.usage import load_usage, select_pins
+    from freetoken.moe.usage import load_usage, load_warm_plan, select_pins, select_warm_pins
 
     if not is_expert_store(store_dir):
         raise ValueError(
@@ -351,23 +352,51 @@ def _store_expert_banks(
             f"re-run `ft experts repack`"
         )
     usage = load_usage(usage_file)
+    if usage is not None and (
+        usage.num_layers != num_layers or usage.num_experts != num_experts
+    ):
+        raise ValueError(
+            f"usage file {usage_file!r} holds {usage.num_layers} x {usage.num_experts} "
+            f"counts but the model wants {num_layers} x {num_experts}"
+        )
     pin_plan: dict[int, list[int]] = {}
-    if usage is not None:
-        if usage.num_layers != num_layers or usage.num_experts != num_experts:
-            raise ValueError(
-                f"usage file {usage_file!r} holds {usage.num_layers} x {usage.num_experts} "
-                f"counts but the model wants {num_layers} x {num_experts}"
+    if warm_file:
+        # A retained-expert plan carries no ranking, so it only seeds residency. A usage
+        # file may still be supplied alongside it to drive the prefetch plan.
+        if usage is not None:
+            logger.info_rank0(
+                "expert store: --expert-warm-file sets the pin plan; "
+                "--expert-usage-file drives prefetch only"
             )
+        plan = load_warm_plan(warm_file)
+        if plan and max(plan) >= num_layers:
+            raise ValueError(
+                f"warm plan {warm_file!r} names layer {max(plan)} but the model has "
+                f"{num_layers} MoE layers"
+            )
+        pin_plan = select_warm_pins(
+            plan, num_layers=num_layers, num_experts=num_experts,
+            expert_bytes=index.expert_bytes(), budget_bytes=pin_budget_bytes,
+        )
+        pinned_from = f"warm plan {warm_file!r}"
+    elif usage is not None:
         pin_plan = select_pins(
             usage, num_experts=num_experts,
             expert_bytes=index.expert_bytes(), budget_bytes=pin_budget_bytes,
         )
+        pinned_from = f"usage file {usage_file!r}"
+    else:
+        pinned_from = None
     source = MmapExpertSource.open(store_dir, pin_plan=pin_plan, warm=warm)
     pinned_experts = sum(len(v) for v in pin_plan.values())
     if pinned_experts:
         logger.info_rank0(
             f"expert store: pinned warm subset {pinned_experts} experts "
-            f"({source.pinned_bytes / 2**30:.2f} GiB)"
+            f"({source.pinned_bytes / 2**30:.2f} GiB) from {pinned_from}"
+        )
+    elif pinned_from:
+        logger.info_rank0(
+            f"expert store: {pinned_from} pin plan is empty (no pin budget); page cache only"
         )
     logger.info_rank0(
         f"expert banks: mmap source ({index.quant_format}, {num_layers} layers x {num_experts} "
@@ -399,6 +428,7 @@ def load_expert_banks(
     expert_source: str = "pinned",
     expert_store: str | None = None,
     expert_usage_file: str | None = None,
+    expert_warm_file: str | None = None,
     expert_pin_budget_bytes: int = 0,
     expert_warm: bool = False,
 ) -> ExpertBanks:
@@ -441,10 +471,12 @@ def load_expert_banks(
             expert_warm = os.environ.get("FREETOKEN_EXPERT_WARM", "").strip().lower() in (
                 "1", "true", "yes", "on",
             )
+        if not expert_warm_file:
+            expert_warm_file = os.environ.get("FREETOKEN_EXPERT_WARM_FILE") or None
         return _store_expert_banks(
             model_path, model_config, store_dir=store_dir,
             usage_file=expert_usage_file, pin_budget_bytes=expert_pin_budget_bytes,
-            warm=expert_warm,
+            warm_file=expert_warm_file, warm=expert_warm,
         )
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:

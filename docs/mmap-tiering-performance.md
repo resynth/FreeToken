@@ -75,6 +75,14 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
     pre-C loop for a direct A/B;
   - a per-token / per-1000-token-prefill projection from the measured whole-expert reads.
   It synthesizes a tiny store when `--store` is omitted, so it runs anywhere.
+- **F - implemented.** `--expert-warm-file` (`FREETOKEN_EXPERT_WARM_FILE`) takes a
+  retained-expert plan (JSON `layer -> [expert ids]`, e.g. the REAP top-384 dump) and pins
+  exactly those experts per layer, budget-capped, with no calibration run
+  (`moe/usage.py: load_warm_plan` / `select_warm_pins`, wired through
+  `moe/expert_banks.py`, `engine/config.py` and `server/args.py`). It carries no frequency
+  information, so it guarantees residency of the retained set rather than a ranking; when
+  `--expert-usage-file` is also given, the warm file still sets the pin plan and the usage
+  file drives prefetch. Budget leftover after the plan is not spent on unplanned experts.
 
 Local C A/B against the real store (`layer-000`, `gate_up`, cache_size 512, ring rows 8,
 `--legacy`, page-warm, 21 reps). Only the chunked cases move; a single-chunk layer is
@@ -245,17 +253,24 @@ Roughly a day including a CPU-vs-GPU equivalence test (there is already
 `tests/moe/test_cpu_moe_gguf_quants.py` to extend).
 
 ### F. Seed the warm/pin set from the REAP top-384 JSON - Impact Med-High, Effort S-M
+_(implemented: `--expert-warm-file`, see Status)_
 `docs/qwen3.8-flash-next-top-384-experts-according-to-sh0wie.json` is 48 layers x exactly 384
 expert ids, **sorted ascending**, i.e. it is the *retained set* of a REAPed sibling, not a
 ranked importance list. 384/512 x 62.4 GiB = 45.7 GiB, which fits the ~51 GiB pin budget
-(`docs/gguf.md:71-81`). So it can be used as a prior today: pin the retained 384 per layer,
+(`docs/gguf.md:71-81`). So it can be used as a prior: pin the retained 384 per layer,
 leave the 128 dropped ones to the page cache. Implementation options, cheapest first:
 - A tiny adapter that emits a `UsageData`-compatible JSON with counts 2 (retained) / 1
   (dropped), consumed by the existing `--expert-usage-file` path
   (`moe/expert_banks.py:352-364` + `moe/usage.py:select_pins`). Caveat: `select_pins` sizes by
   `expert_bytes` and a per-layer floor, so this pins exactly the retained set only if the
   budget allows; that is the intent.
-- Or a new `--expert-warm-file` that directly sets the pin plan.
+- Or a new `--expert-warm-file` that directly sets the pin plan. **This is what was built**:
+  the loader reads the REAP JSON as-is (`layer -> [ids]`), `select_warm_pins` pins the listed
+  experts under the same per-layer floor as `select_pins` but never spends leftover budget on
+  unplanned experts (there is no ranking to order them by). Out-of-range/duplicate ids are
+  dropped. The adapter option was not built - the dedicated flag avoids conflating a
+  residency plan with routing counts, and `--expert-usage-file` can still be passed alongside
+  to drive prefetch.
 Caveat: this is a different (REAPed) checkpoint; if REAP renumbered experts the mapping is
 wrong, and it carries no frequency information, so it mostly guarantees residency of 75% of
 experts rather than optimal ranking. It also does not fix #1/#3, so it is a complement, not a
@@ -322,10 +337,12 @@ is host-side and only meaningful once #1/#3 are fixed.
 
 ## Answers to the specific questions
 
-**Will a starting expert set help? Yes, but not as the first move.**
+**Will a starting expert set help? Yes.**
 The REAP JSON (F) is a good zero-cost warm/pin set (384 of 512 fits the pin budget), and it
-avoids the slow calibration run. But residency does not help while cold experts cost 4 KiB
-faults (A) and while the staged copy syncs per layer (C); fix those first, then F.
+avoids the slow calibration run. Residency does not help while cold experts cost 4 KiB faults
+(A) or while the staged copy syncs per layer (C) - fix those first, then F. A, C and F are
+now implemented: pass `--expert-warm-file docs/qwen3.8-flash-next-top-384-experts-according-to-sh0wie.json`
+with `--expert-source mmap`.
 
 **`--moe-strategy cpu` / hybrid: worth unblocking?**
 Yes, probably the largest steady-state win here, because it removes the PCIe term (root cause
@@ -400,7 +417,8 @@ surfaces:
 2. B (startup page-cache warm) - first token and prefill. _Done._
 3. C (batched staged copy, one sync/layer) + I (current-layer prefetch) + N (flags/warning so
    the A/B runs are reproducible). _C done; I and N remain._
-4. F (REAP-seeded warm set) or G (stats) - residency/prefetch.
+4. F (REAP-seeded warm set) or G (stats) - residency/prefetch. _F done
+   (`--expert-warm-file`); G still needs the offline `ft experts stats` pass._
 5. E + D (composite CPU ext, then CPU/hybrid over the mmap store) - the big architectural win.
 6. H, J, K as follow-ups.
 
@@ -447,6 +465,10 @@ See `docs/mmap-tiering-performance.md` for the full status and numbers.
   times the old staged loop vs the new one, so ring/size/usage changes get A/B numbers
   without the server. On the real store the default ring of 8 measured fastest (do not
   raise `FREETOKEN_EXPERT_RING_ROWS` without re-running it).
+- **Warm set without calibration (F, done):** `--expert-warm-file` /
+  `FREETOKEN_EXPERT_WARM_FILE` accepts a retained-expert plan (JSON `layer -> [expert ids]`,
+  e.g. the REAP top-384 dump) and pins those experts per layer, budget-capped, with no
+  `ft experts stats` run. A usage file can still be passed alongside to drive prefetch.
 - **Still open:** `--moe-strategy cpu`/hybrid is blocked on composite `iq4_xs+iq4_nl`
   support in the CPU MoE extension (E) plus wiring the mmap source to the CPU executor (D);
   that removes the PCIe term and is the big architectural win.
