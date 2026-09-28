@@ -49,6 +49,10 @@ class ExpertBanks:
     kind: QuantKind | None = None
     kernel: str | None = None
     layout: dict | None = None
+    # "pinned" (today's behaviour) or "mmap" (file-backed store, staged H2D). For "mmap",
+    # ``source`` holds the ExpertSource the staged copy path reads rows from.
+    tier: str = "pinned"
+    source: object | None = None
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -301,6 +305,82 @@ def bank_bytes_estimate(model_config, method=None) -> int | None:
     return layers * experts * per_expert(hidden, inter)
 
 
+def _store_expert_banks(
+    model_path: str,
+    model_config,
+    *,
+    store_dir: str,
+    usage_file: str | None,
+    pin_budget_bytes: int,
+) -> ExpertBanks:
+    """Load an expert store through the mmap source, optionally pinning a usage-ranked subset."""
+    from freetoken.moe.expert_source import MmapExpertSource
+    from freetoken.moe.expert_store import ExpertStoreIndex, is_expert_store
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.usage import load_usage, select_pins
+
+    if not is_expert_store(store_dir):
+        raise ValueError(
+            f"no expert store at {store_dir!r}; build one with "
+            f"`ft experts repack {model_path} --out {store_dir}`"
+        )
+    index = ExpertStoreIndex.load(store_dir)
+    num_layers = getattr(model_config, "num_moe_layers", None) or index.num_layers
+    num_experts = getattr(model_config, "num_experts", None) or index.num_experts
+    if index.num_layers != num_layers or index.num_experts != num_experts:
+        raise ValueError(
+            f"expert store {store_dir!r} holds {index.num_layers} layers x {index.num_experts} "
+            f"experts but the model wants {num_layers} x {num_experts}; re-run `ft experts repack`"
+        )
+    expected_format = getattr(model_config, "expert_quant", None)
+    if expected_format and expected_format != "none" and index.quant_format != expected_format:
+        raise ValueError(
+            f"expert store {store_dir!r} is {index.quant_format!r} but the model's expert_quant "
+            f"is {expected_format!r}; re-run `ft experts repack`"
+        )
+    # The native-GGUF path has no kernel layout to check bank shapes against, so a store
+    # from a same-shape-count but differently-sized checkpoint would address rows with the
+    # wrong row_bytes; compare the geometry the store recorded.
+    hidden = getattr(model_config, "hidden_size", None)
+    inter = getattr(model_config, "moe_intermediate_size", None)
+    if hidden and inter and (index.hidden_size, index.intermediate_size) != (hidden, inter):
+        raise ValueError(
+            f"expert store {store_dir!r} is for hidden/intermediate "
+            f"{index.hidden_size}/{index.intermediate_size} but the model is {hidden}/{inter}; "
+            f"re-run `ft experts repack`"
+        )
+    usage = load_usage(usage_file)
+    pin_plan: dict[int, list[int]] = {}
+    if usage is not None:
+        if usage.num_layers != num_layers or usage.num_experts != num_experts:
+            raise ValueError(
+                f"usage file {usage_file!r} holds {usage.num_layers} x {usage.num_experts} "
+                f"counts but the model wants {num_layers} x {num_experts}"
+            )
+        pin_plan = select_pins(
+            usage, num_experts=num_experts,
+            expert_bytes=index.expert_bytes(), budget_bytes=pin_budget_bytes,
+        )
+    source = MmapExpertSource.open(store_dir, pin_plan=pin_plan)
+    pinned_experts = sum(len(v) for v in pin_plan.values())
+    if pinned_experts:
+        logger.info_rank0(
+            f"expert store: pinned warm subset {pinned_experts} experts "
+            f"({source.pinned_bytes / 2**30:.2f} GiB)"
+        )
+    logger.info_rank0(
+        f"expert banks: mmap source ({index.quant_format}, {num_layers} layers x {num_experts} "
+        f"experts from {store_dir})"
+    )
+    return ExpertBanks(
+        index.quant_format,
+        source.all_layer_views(),
+        layer_residency=[HostResidency.MMAP.value] * num_layers,
+        tier="mmap",
+        source=source,
+    )
+
+
 def load_expert_banks(
     model_path: str,
     model_config,
@@ -315,6 +395,10 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    expert_source: str = "pinned",
+    expert_store: str | None = None,
+    expert_usage_file: str | None = None,
+    expert_pin_budget_bytes: int = 0,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -341,6 +425,20 @@ def load_expert_banks(
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
+
+    if expert_source == "mmap" and not dummy:
+        from freetoken.moe.expert_store import default_store_dir
+
+        store_dir = expert_store or default_store_dir(model_path)
+        if not store_dir:
+            raise ValueError(
+                "--expert-source mmap needs an expert store; pass --expert-store <dir> "
+                "or run `ft experts repack <gguf> --out <dir>`"
+            )
+        return _store_expert_banks(
+            model_path, model_config, store_dir=store_dir,
+            usage_file=expert_usage_file, pin_budget_bytes=expert_pin_budget_bytes,
+        )
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
         banks = load_ftw_banks(

@@ -150,6 +150,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be in [0, 1]")
         return rate
 
+    def _parse_pin_fraction(value: str) -> float:
+        try:
+            rate = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a fraction in [0, 1]") from exc
+        if not 0 <= rate <= 1:
+            raise argparse.ArgumentTypeError("must be in [0, 1]")
+        return rate
+
     def _positive_int(value: str) -> int:
         try:
             n = int(value)
@@ -657,6 +666,56 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--expert-source",
+        default=ServerArgs.expert_source,
+        choices=["auto", "pinned", "mmap"],
+        help=(
+            "Where MoE expert rows are served from. 'auto' (default) pins the banks when "
+            "they fit the host pin budget, else reads them from a repacked expert store via "
+            "mmap (the OS page cache is the warm tier, the SSD the cold tier); 'pinned' keeps "
+            "today's behaviour and errors when the banks do not fit; 'mmap' always uses the "
+            "store. The mmap path needs a store built with `ft experts repack <gguf>`."
+        ),
+    )
+
+    parser.add_argument(
+        "--expert-store",
+        default=ServerArgs.expert_store,
+        help=(
+            "Repacked expert store dir for --expert-source mmap. Default: alongside the "
+            "checkpoint (<model>.experts for a GGUF, <model>/experts for a dir); "
+            "FREETOKEN_EXPERT_STORE overrides."
+        ),
+    )
+
+    parser.add_argument(
+        "--expert-usage-file",
+        default=ServerArgs.expert_usage_file,
+        help=(
+            "Per-(layer, expert) routing counts from `ft experts stats` (or a server's "
+            "decode-frequency dump). With an mmap source the top experts per layer are "
+            "copied into pinned host RAM and prefetched; without it no explicit pinning."
+        ),
+    )
+
+    parser.add_argument(
+        "--expert-pin-budget",
+        type=float,
+        default=ServerArgs.expert_pin_budget,
+        help=(
+            "GiB of host RAM to pin for the usage-ranked warm subset (mmap source). "
+            "Default: the pin budget minus the staging ring."
+        ),
+    )
+
+    parser.add_argument(
+        "--expert-pin-fraction",
+        type=_parse_pin_fraction,
+        default=ServerArgs.expert_pin_fraction,
+        help="Fraction of the host pin budget to use for the warm subset (mmap source).",
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",
@@ -743,6 +802,17 @@ def parse_args(
             "Disable two-buffer overlap for prefill MoE expert copies. "
             "By default, prefill overlap is enabled and requires "
             "--moe-cache-size >= 2 * num_experts."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        dest="moe_collect_stats",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Accumulate MoE decode miss-rate counters (and per-(layer, expert) routing "
+            "counts) for `ft ctl` / offline usage. Leave off for production throughput."
         ),
     )
 

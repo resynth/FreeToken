@@ -43,10 +43,17 @@ differently; that is a **composite format tag** `<gate_up>+<down>` (e.g. `iq4_xs
 the per-role types from it.
 
 The expert banks are read once at startup into **pinned host RAM** and streamed to a
-GPU LRU slot cache (`--moe-cache-size` / `--moe-cache-auto`). There is no disk-backed expert
-source yet, so the full packed expert set must fit pinned host RAM; on plain Linux the pin
-budget is 90% of `MemAvailable` (`FREETOKEN_PIN_BUDGET_GB` overrides) and an oversized model
-stops with a clear error instead of OOM-crashing the host.
+GPU LRU slot cache (`--moe-cache-size` / `--moe-cache-auto`). When the full packed expert
+set does not fit pinned host RAM (on plain Linux the pin budget is 90% of `MemAvailable`;
+`FREETOKEN_PIN_BUDGET_GB` overrides), repack it with `ft experts repack <gguf>` and boot
+with `--expert-source mmap`: the store is mapped read-only, the OS page cache is the warm
+tier and the SSD the cold tier, so RAM becomes the working set rather than the total.
+Pass `--drop-ple` when the checkpoint carries its own `per_layer_token_embd.weight` (the
+qwen4exp GGUFs do; ~28.8 GiB here) - the engine serves the fp8 table from `--ple-source`,
+so archiving the GGUF copy only wastes disk.
+An optional `ft experts stats` usage file pins the top experts per layer and prefetches
+them one layer ahead. Without that, an oversized model still stops with a clear error
+instead of OOM-crashing the host.
 
 ## Qwen3.8-Flash-Next (`qwen4exp`)
 
@@ -70,8 +77,18 @@ stops with a clear error instead of OOM-crashing the host.
    320        38.1 GiB
    352        41.9 GiB
    384        45.7 GiB
-   512        60.9 GiB   <- current, won't fit
-  With ~56 GiB MemAvailable and ~4–6 GiB for the process/dense/KV, the practical ceiling is ~352–384 experts; 320 is comfortable. expert_used_count (top-k=10) must stay ≤ N.
+   512        60.9 GiB   <- served from the mmap store, see below
+  With ~56 GiB MemAvailable and ~4–6 GiB for the process/dense/KV, the pinned path's practical ceiling is ~352–384 experts; 320 is comfortable. expert_used_count (top-k=10) must stay ≤ N.
+
+To serve the 512-expert IQ4_XS GGUF on a ~62 GiB host (banks exceed the pin budget):
+```
+ft experts repack <gguf> --out <store> --drop-ple
+ft serve --model <gguf> --ple-source Saren/Qwen3.8-Flash-Next-ple-table-fp8 \
+    --expert-source mmap --expert-store <store> --moe-cache-auto
+```
+See [mmap-expert-tiering.md](mmap-expert-tiering.md) "Running with the store": staged decode
+is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs, and an
+`--expert-usage-file` from `ft experts stats` adds the pinned warm subset and prefetch.
 
 ## Verification
 
@@ -86,8 +103,42 @@ stops with a clear error instead of OOM-crashing the host.
 
 ## Known limits / TODOs
 
-- Offload requires the whole expert set in pinned host RAM; see
-  `mmap-expert-tiering.md` for the planned hot/warm/cold tiers.
+- Offload pins the whole expert set by default; the disk-backed mmap tier
+  (`ft experts repack` + `--expert-source mmap`, see `mmap-expert-tiering.md`) now serves
+  sets that exceed the pin budget. Deferred follow-ups from the v1 review:
+  - Staged decode copies miss rows one at a time in a Python loop
+    (`offload_cache.py:_copy_missing_staged`) instead of a batched gather; batch it once the
+    source grows a `warm_rows` gather.
+  - Each staged layer does two device syncs per step (`num_indices.item()` and
+    `src_indices.cpu()`), including the all-hit case; read both from one pinned host buffer.
+  - An auto-selected mmap source disables decode CUDA graphs with only an info log
+    (`engine._finish_mmap_source`); warn explicitly when `--expert-source auto` picks mmap.
+  - `FREETOKEN_EXPERT_RING_ROWS` default is duplicated in `engine._resolve_expert_pin_budget`
+    and `OffloadMoeCache.__post_init__`, so the budget and the allocated ring can drift.
+  - The repack writer's GGUF tensor-name -> role mapping duplicates
+    `moe/gguf_experts.py:load_gguf_expert_sources`; a new naming or fused form must be
+    updated in both.
+  - `moe/expert_source.py:PinnedExpertSource` and the `ExpertSource.resident`/`expert_bytes`
+    members are defined but unused.
+  - The cold-path O_DIRECT option and `mincore`-based cold-read counters from the plan are
+    not implemented; ring fill is a page-cache copy. Both are benchmark-gated in the plan,
+    not committed behaviour.
+  - Online per-`(layer, expert)` counters are not wired to `--moe-collect-stats`: the server
+    path only accumulates `lru_stats` (miss rate), while the histogram needs
+    `collect_decode_freq` set programmatically and has no dump endpoint, so
+    `--expert-usage-file` currently needs the offline `ft experts stats` pass.
+  - The mmap store is native-GGUF only (`q4_0`/`q5_K`/`iq4_nl`/`iq4_xs` and composite tags)
+    and requires contiguous expert layers; nvfp4/mxfp4/fp8-block and HF/FTW checkpoints keep
+    the pinned path, and leading-dense expert layouts are rejected by the repack.
+  - `ft checkpoint` does not emit an expert store, and the engine checks the store's
+    format/geometry but not its `fingerprint`/`source_path`, so a same-geometry store built
+    from a different checkpoint is accepted silently.
+  - Prefetch depth (`FREETOKEN_EXPERT_PREFETCH`) and ring rows
+    (`FREETOKEN_EXPERT_RING_ROWS`) are env-only, with no CLI flags.
+  - `ft experts stats` runs the full model eagerly and has no test coverage (needs a real
+    checkpoint).
+  - Online adaptive re-pinning (calibration/production drift detection) stays out of scope
+    for v1 per `mmap-expert-tiering.md`, gated on per-layer telemetry showing divergence.
 - Expert format must be uniform across layers (one tag per model). Unsloth "dynamic" quants
   that vary the type per layer are rejected for now.
 - FTW conversion is not wired for `qwen4exp`: a metadata-only GGUF has no tensor table, so the

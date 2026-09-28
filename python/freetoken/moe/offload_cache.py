@@ -286,6 +286,21 @@ class OffloadMoeCache:
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
         self._unpinned_layers: frozenset = frozenset()
+        # mmap-source layers: no device alias, but staged through a pinned ring, so they
+        # still decode on the GPU. Kept disjoint from _unpinned_layers (CPU-executor only).
+        self._staged_layers: frozenset = frozenset()
+        self.expert_source = None
+        # usage-ranked per-layer expert ids to MADV_WILLNEED one layer ahead (None = off)
+        self.usage_prefetch: list[list[int]] | None = None
+        self._staging_ready = False
+        self._staging_ring: dict[str, torch.Tensor] = {}
+        self._staging_device: dict[str, torch.Tensor] = {}
+        self._staging_rows = max(1, int(os.environ.get("FREETOKEN_EXPERT_RING_ROWS", "8")))
+        # mmap tiering telemetry, per layer: rows served from the pinned warm subset vs
+        # staged from the mmap/page cache. Host-side (the staged path is host-driven), so
+        # plain lists, not device tensors.
+        self.staged_pinned_layer = [0] * self.num_layers
+        self.staged_page_layer = [0] * self.num_layers
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
@@ -366,6 +381,7 @@ class OffloadMoeCache:
         self,
         sources: dict[str, list[torch.Tensor]],
         layer_residency: list[str] | None = None,
+        expert_source=None,
     ) -> None:
         """Attach the host (CPU pinned) expert source banks and allocate a GPU slot
         cache per bank, following the format's bank schema.
@@ -392,8 +408,12 @@ class OffloadMoeCache:
         sources = {name: by_role[canonical_role(name)] for name in self.bank_schema}
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
+        staged = frozenset(
+            i for i, r in enumerate(residency) if r == HostResidency.MMAP.value
+        )
         unpinned = frozenset(
-            i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
+            i for i, r in enumerate(residency)
+            if r not in (HostResidency.PINNED.value, HostResidency.MMAP.value)
         )
         if unpinned:
             if not unpinned <= self.cpu_layer_ids:
@@ -408,6 +428,11 @@ class OffloadMoeCache:
                     "when any layer is LOCKED/PAGEABLE (the engine does this)"
                 )
         self._unpinned_layers = unpinned
+        self._staged_layers = staged
+        self.expert_source = expert_source
+        self._staging_ready = False
+        self._staging_ring = {}
+        self._staging_device = {}
         self.layer_residency = list(residency)
         for name in self.bank_schema:
             per_layer = sources[name]
@@ -441,6 +466,8 @@ class OffloadMoeCache:
         self._build_fused_copy_plan()
         if self._copy_fused_ok or self.device.type != "cuda" or not self.banks:
             return
+        if self._staged_layers == frozenset(range(self.num_layers)):
+            return  # every layer stages through the ring; the per-bank pinned copy is unused
         for name in self.bank_schema:
             cache = self.bank_caches[name]
             feat = math.prod(cache.shape[1:]) * cache.element_size()
@@ -479,7 +506,7 @@ class OffloadMoeCache:
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
-                if layer_id in self._unpinned_layers:
+                if layer_id in self._unpinned_layers or layer_id in self._staged_layers:
                     # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
                     # a 0 placeholder keeps the descriptor shape
                     layer_src_ptrs[layer_id].append(0)
@@ -548,6 +575,10 @@ class OffloadMoeCache:
         self.validate_rebuild(cache_size)
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
+        # staged rings alias old bank_caches too; rebuilt lazily against the new ones
+        self._staging_ready = False
+        self._staging_ring = {}
+        self._staging_device = {}
         self.prefill_copy_stream = None
         self.prefill_begin_event = None
         self.prefill_ready_events = []
@@ -595,6 +626,8 @@ class OffloadMoeCache:
         self.decode_freq.zero_()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self.staged_pinned_layer = [0] * self.num_layers
+        self.staged_page_layer = [0] * self.num_layers
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
         # 5. Re-evaluate prefill overlap against the new size.
         if self.prefill_overlap and cache_size < 2 * self.num_experts:
@@ -645,6 +678,14 @@ class OffloadMoeCache:
         """Whether ``layer_id``'s host banks have no device address (LOCKED/PAGEABLE): the GPU slot-gather paths cannot serve it.
         ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id (never ``ensure_experts``'s LRU slot remap)."""
         return layer_id in self._unpinned_layers
+
+    def is_staged_layer(self, layer_id: int) -> bool:
+        """Whether ``layer_id``'s banks are mmap-backed and staged through the pinned ring.
+
+        Staged layers have no device alias either, but ``copy_missing`` resolves their
+        LRU slot remap on the host and stages the rows, so they still decode on the GPU.
+        """
+        return layer_id in self._staged_layers
 
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Per-slot global scales for a decode call, or ``None`` when the format
@@ -784,6 +825,8 @@ class OffloadMoeCache:
 
         if self._prefill_slot_snapshot is None or self.prefill_copy_stream is None:
             reason = "prefill overlap buffers are not initialized for this device"
+        elif self._staged_layers:
+            reason = "staged mmap layers have no device source alias for the hit gather"
         elif _skip_fast_index_copy_enabled():
             reason = "FREETOKEN_SKIP_FAST_INDEX_COPY is set (the hit gather would be a no-op)"
         elif not self._copy_fused_ok:
@@ -923,6 +966,7 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        self._prefetch_next_layer(layer_id)
         ensure_experts(self, layer_id, expert_ids)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -973,6 +1017,8 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        self.staged_pinned_layer = [0] * self.num_layers
+        self.staged_page_layer = [0] * self.num_layers
 
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.
@@ -997,6 +1043,28 @@ class OffloadMoeCache:
         self.stat_fetched_layer[layer_id] += fetched
         self.stat_active_layer[layer_id] += active
         self.stat_steps_layer[layer_id] += 1
+
+    def staged_tier_stats(self) -> dict:
+        """Per-layer RAM-tier breakdown for the mmap source: pinned-subset vs page-cache rows.
+
+        Reported per layer rather than as one model-wide average so a layer starved by the
+        pin allocation cannot hide inside a healthy mean.
+        """
+        per_layer = [
+            {
+                "layer": layer,
+                "pinned_rows": self.staged_pinned_layer[layer],
+                "page_rows": self.staged_page_layer[layer],
+                "pinned_rate": (
+                    self.staged_pinned_layer[layer]
+                    / (self.staged_pinned_layer[layer] + self.staged_page_layer[layer])
+                    if (self.staged_pinned_layer[layer] + self.staged_page_layer[layer])
+                    else 0.0
+                ),
+            }
+            for layer in range(self.num_layers)
+        ]
+        return {"per_layer": per_layer}
 
     def decode_miss_stats(self) -> dict:
         if self.decode_target == "hybrid":
@@ -1081,10 +1149,91 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
+    def _prefetch_next_layer(self, layer_id: int) -> None:
+        """MADV_WILLNEED the next layer's usage-ranked experts before this layer's GEMM.
+
+        Only the mmap source can prefetch; a pinned source is already resident. Host code,
+        never captured, so the mmap tier runs with CUDA graphs disabled.
+        """
+        source = self.expert_source
+        plan = self.usage_prefetch
+        if source is None or not plan:
+            return
+        nxt = layer_id + 1
+        if nxt < self.num_layers:
+            source.prefetch(nxt, plan[nxt])
+
+    def _ensure_staging(self) -> None:
+        """Allocate the pinned ring + device bounce per bank (never inside graph capture)."""
+        if self._staging_ready:
+            return
+        for role in self.bank_schema:
+            cache = self.bank_caches[role]
+            shape = tuple(cache.shape[1:])
+            if self.device.type == "cuda":
+                from freetoken.kernel.pinned import alloc_pinned_tensor
+
+                ring = alloc_pinned_tensor(self._staging_rows, *shape, dtype=cache.dtype)
+            else:
+                ring = torch.empty((self._staging_rows, *shape), dtype=cache.dtype)
+            self._staging_ring[role] = ring
+            self._staging_device[role] = torch.empty(
+                (self._staging_rows, *shape), dtype=cache.dtype, device=self.device
+            )
+        self._staging_ready = True
+
+    def _copy_missing_staged(self, layer_id: int) -> None:
+        """Resolve an LRU slot remap for an mmap-backed layer through the pinned ring.
+
+        ``ensure_experts`` left ``src_indices`` (layer-local expert ids) and ``evict_slots``
+        (cache slots) on the device; a host sync reads them, the rows are staged from the
+        source (page cache or the pinned warm subset), and one H2D + device scatter lands
+        them in the slot cache. Correct but host-synchronized, so staged decode is eager.
+        """
+        n = int(self.num_indices.item())
+        if n <= 0:
+            return
+        self._ensure_staging()
+        evict = self.evict_slots[:n]
+        src_ids = self.src_indices[:n].cpu().tolist()
+        for role, (per_layer, cache) in zip(self.bank_schema, self.banks):
+            ring = self._staging_ring[role]
+            device = self._staging_device[role]
+            rows = ring.shape[0]
+            for start in range(0, n, rows):
+                m = min(rows, n - start)
+                for c in range(m):
+                    expert = int(src_ids[start + c])
+                    if self.expert_source is not None:
+                        row = self.expert_source.warm_row(layer_id, role, expert)
+                        is_pinned = getattr(self.expert_source, "is_pinned_row", None)
+                        if is_pinned is None or is_pinned(layer_id, role, expert):
+                            self.staged_pinned_layer[layer_id] += 1
+                        else:
+                            self.staged_page_layer[layer_id] += 1
+                    else:
+                        row = per_layer[layer_id][expert]
+                    ring[c].copy_(row)
+                device[:m].copy_(ring[:m], non_blocking=True)
+                cache.index_copy_(0, evict[start : start + m].long(), device[:m])
+                if start + m < n and self.device.type == "cuda":
+                    # the next chunk refills `ring` on the CPU while this chunk's pinned->CUDA
+                    # DMA may still be reading it; drain the copy before overwriting the ring
+                    torch.cuda.current_stream(self.device).synchronize()
+
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if layer_id in self._staged_layers:
+            if self._pending_whole_layer:
+                # non-overlap prefill materializes the whole layer at position == expert id
+                # from the pageable mmap views directly (no ring); decode never takes this.
+                for per_layer, cache in self.banks:
+                    cache[: self.num_experts].copy_(per_layer[layer_id])
+                return
+            self._copy_missing_staged(layer_id)
+            return
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(

@@ -1,0 +1,125 @@
+"""``ft experts``: repack routed experts for the mmap source and rank their usage.
+
+Subcommands:
+  repack  Build a fixed-stride expert store from a GGUF (verbatim, no dequant).
+  stats   Run a calibration corpus through the model and write a usage file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+
+def _repack(args: argparse.Namespace) -> int:
+    from freetoken.moe.expert_store import repack_gguf_experts
+
+    t0 = time.time()
+    index = repack_gguf_experts(args.model, args.out, drop_ple=args.drop_ple)
+    total = index.num_layers * index.num_experts * index.expert_bytes()
+    print(
+        f"repacked {index.num_layers} layers x {index.num_experts} experts "
+        f"({index.quant_format}) -> {args.out}\n"
+        f"  {total / 2**30:.2f} GiB, fingerprint {index.fingerprint}, "
+        f"{time.time() - t0:.1f}s"
+    )
+    print(f"serve with: ft serve --model {args.model} --expert-source mmap --expert-store {args.out}")
+    return 0
+
+
+def _stats(args: argparse.Namespace) -> int:
+    import torch
+
+    from freetoken.core import SamplingParams
+    from freetoken.gpu_select import assign_gpu, bind_assigned_gpu
+    from freetoken.moe.usage import UsageData
+
+    try:
+        assign_gpu(args.gpu)
+        bind_assigned_gpu()
+    except (ValueError, RuntimeError) as exc:
+        print(f"ft experts stats: {exc}", file=sys.stderr)
+        return 2
+
+    from freetoken.llm import LLM
+
+    with open(args.calib, encoding="utf-8") as f:
+        text = f.read()
+    dtype = getattr(torch, args.dtype)
+    llm = LLM(
+        args.model,
+        dtype=dtype,
+        moe_strategy="offload",
+        moe_collect_stats=True,
+        cuda_graph_bs=[],
+        cuda_graph_max_bs=0,
+    )
+    cache = getattr(llm.engine, "moe_offload_cache", None)
+    if cache is None:
+        print(f"ft experts stats: {args.model} has no offloaded expert cache", file=sys.stderr)
+        return 2
+    # The routing histogram is host-accumulated before the LRU kernel rewrites ids, so it
+    # is only accurate without a captured decode graph (which is why graphs are disabled).
+    cache.collect_decode_freq = True
+    sampling = SamplingParams(temperature=0.0, max_new_tokens=args.max_new_tokens, ignore_eos=True)
+    llm.generate([text], sampling)
+    usage = UsageData.from_freq(cache.decode_freq, source=args.calib)
+    out = args.out or (args.model + ".usage.json")
+    usage.save(out)
+    totals = usage.totals()
+    print(
+        f"wrote {out}: {usage.num_layers} layers x {usage.num_experts} experts, "
+        f"{sum(totals)} routed activations"
+    )
+    print(f"serve with: --expert-usage-file {out} --expert-source mmap")
+    return 0
+
+
+def _add_common(p: argparse.ArgumentParser) -> None:
+    from freetoken.gpu_select import single_gpu_arg
+
+    p.add_argument("--gpu", type=single_gpu_arg, default=None, help="GPU UUID or nvidia-smi index (as ft serve --gpu)")
+
+
+def _print_help(file) -> None:
+    print(
+        """usage: ft experts <subcommand> [args]
+
+Subcommands:
+  repack  Build a fixed-stride expert store from a GGUF (verbatim, no dequant)
+  stats   Rank expert usage from a calibration corpus and write a usage file
+
+Use "ft experts <subcommand> --help" for subcommand-specific options.""",
+        file=file,
+    )
+
+
+def main(argv: list[str] | None = None, prog: str = "ft experts") -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in {"-h", "--help"}:
+        _print_help(sys.stdout if args else sys.stderr)
+        return 0 if args else 2
+    sub, rest = args[0], args[1:]
+    if sub == "repack":
+        p = argparse.ArgumentParser(prog=f"{prog} repack", description="Repack GGUF routed experts into a fixed-stride store.")
+        p.add_argument("model", help="source .gguf (or a shard of a split GGUF)")
+        p.add_argument("--out", required=True, help="output expert-store dir")
+        p.add_argument("--drop-ple", action="store_true", help="do not archive the in-GGUF per-layer token embedding")
+        return _repack(p.parse_args(rest))
+    if sub == "stats":
+        p = argparse.ArgumentParser(prog=f"{prog} stats", description="Rank expert usage from a calibration corpus.")
+        p.add_argument("--model", required=True, help="checkpoint dir or .gguf")
+        p.add_argument("--calib", required=True, help="calibration text file")
+        p.add_argument("--out", default=None, help="usage file to write (default <model>.usage.json)")
+        p.add_argument("--max-new-tokens", type=int, default=128, help="decode tokens to run")
+        p.add_argument("--dtype", default="bfloat16", help="model dtype (default bfloat16)")
+        _add_common(p)
+        return _stats(p.parse_args(rest))
+    print(f"unknown ft experts subcommand: {sub}", file=sys.stderr)
+    _print_help(sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

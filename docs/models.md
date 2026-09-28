@@ -40,7 +40,10 @@ These families accept image input by default; pass `--text-model-only` to skip t
 
 - **fused** — experts resident on GPU (needs the VRAM); never auto-selected.
 - **offload** — experts live in host RAM, an LRU cache of expert slots on GPU;
-  misses stream over PCIe.
+  misses stream over PCIe. When the banks exceed the host pin budget, repack them with
+  `ft experts repack` and they are served from an mmap store instead (`--expert-source mmap`),
+  staged through a pinned ring; an optional `ft experts stats` usage file pins the hottest
+  experts per layer.
 - **cpu** — misses are computed on the CPU instead of fetched.
 - **hybrid** — per step, fetches some misses over PCIe and computes the rest on
   CPU, overlapped. Run `ft bench bw` once per machine to calibrate the split.

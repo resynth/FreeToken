@@ -156,3 +156,46 @@ Two implementations:
   detection of calibration/production drift, so a mismatch shows up only as a worse hit rate,
   not an error. Deferred follow-up if per-layer telemetry shows real divergence from
   calibration: online adaptive re-pinning — deliberately out of scope for v1.
+
+## Running with the store
+
+Verified on a 62 GiB / 16 GiB host with the 512-expert Qwen3.8-Flash-Next IQ4_XS GGUF
+(60.94 GiB of banks vs a 51.1 GiB pin budget).
+
+1. Build the extensions if the tree has none:
+   ```
+   CXX=g++-13 CC=gcc-13 python setup.py build_ext --inplace
+   ```
+2. Repack once (reads the expert tensors verbatim; ~125 s for 60.9 GiB here):
+   ```
+   ft experts repack <model.gguf> --out <store> --drop-ple
+   ```
+   `--drop-ple` skips the checkpoint's own `per_layer_token_embd.weight`. The qwen4exp GGUFs
+   carry one (~28.8 GiB) that the engine never reads when `--ple-source` is set, so archiving
+   it only wastes disk. If you already built a store without it, delete `<store>/ple.bin` and
+   remove the `"ple"` key from `<store>/index.json`.
+3. Serve:
+   ```
+   ft serve \
+     --model <model.gguf> \
+     --ple-source <fp8-ple-dir-or-repo-id> \
+     --expert-source mmap \
+     --expert-store <store> \
+     --moe-cache-auto
+   ```
+   A bare GGUF has no fp8 PLE table, so `--ple-source` is required (an HF repo id such as
+   `Saren/Qwen3.8-Flash-Next-ple-table-fp8` also works, resolved through the HF cache).
+
+Behaviour to expect:
+
+- **Staged decode runs eagerly**: the mmap source logs
+  `mmap expert source: disabling CUDA graphs (staged H2D is host-driven)`. This is v1's
+  correctness-first tradeoff; `ft experts stats` + the pinned warm subset recover speed.
+- **`--moe-cache-auto` sizes the GPU slot cache from free VRAM.** On a 16 GiB card with this
+  model it resolved `moe_cache_size=2232` and left ~1.5 GiB free. If decode OOMs, pass an
+  explicit `--moe-cache-size` (e.g. 1536) instead.
+- **No usage file -> no explicit pinning or prefetch**: the page cache and LRU only. Run
+  `ft experts stats --model <model.gguf> --calib <text>` to write one, then add
+  `--expert-usage-file <usage.json>`.
+- **`--expert-source auto` (default)** picks mmap when the banks exceed the pin budget and a
+  store exists; without a store it fails with the `ft experts repack` command to run.

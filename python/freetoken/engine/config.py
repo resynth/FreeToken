@@ -52,6 +52,19 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # Expert source (--expert-source): auto|pinned|mmap. "auto" pins when the banks fit the
+    # pin budget, else falls back to a file-backed mmap store (staged H2D); "pinned" keeps
+    # today's error when the banks do not fit; "mmap" requires a repacked store.
+    expert_source: str = "auto"
+    # Repacked expert store dir (--expert-store); None -> default_store_dir(model_path).
+    expert_store: str | None = None
+    # Usage-ranked warm subset (--expert-usage-file, from `ft experts stats`): the top
+    # experts per layer are copied into pinned RAM. expert_pin_budget (GiB) or
+    # expert_pin_fraction of the pin budget sizes it; both None fills the pin budget minus
+    # the staging ring. No usage file -> no explicit pinning (page cache + LRU only).
+    expert_usage_file: str | None = None
+    expert_pin_budget: float | None = None
+    expert_pin_fraction: float | None = None
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

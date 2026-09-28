@@ -617,7 +617,7 @@ class Engine:
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
-        _check_pin_budget(config, reserved=self._host_tables_bytes, method=method)
+        expert_source_mode = _select_expert_source(config, reserved=self._host_tables_bytes, method=method)
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target
         if decode_target == "cpu" and not cpu_layer_ids:
@@ -657,6 +657,9 @@ class Engine:
         # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
+        pin_budget_bytes = 0
+        if expert_source_mode == "mmap":
+            pin_budget_bytes = _resolve_expert_pin_budget(config, reserved=self._host_tables_bytes, method=method)
         requested_residency = None
         if split_residency:
             from freetoken.moe.host_banks import HostResidency
@@ -678,6 +681,10 @@ class Engine:
                     parallel=expert_parallel,
                     decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
+                    expert_source=expert_source_mode,
+                    expert_store=config.expert_store,
+                    expert_usage_file=config.expert_usage_file,
+                    expert_pin_budget_bytes=pin_budget_bytes,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
@@ -726,8 +733,12 @@ class Engine:
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
-        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+        cache.set_bank_sources(
+            banks.sources, layer_residency=banks.layer_residency, expert_source=banks.source
+        )
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        if banks.tier == "mmap":
+            _finish_mmap_source(config, cache)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
@@ -1386,6 +1397,115 @@ def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> No
         )
 
 
+def _store_dir_for(config: EngineConfig) -> str | None:
+    from freetoken.moe.expert_store import default_store_dir
+
+    return config.expert_store or default_store_dir(config.model_path)
+
+
+def _repackable_for_mmap(config: EngineConfig) -> bool:
+    """Whether `ft experts repack` can build a store for this checkpoint (native-GGUF experts)."""
+    from freetoken.models.gguf.reader import is_gguf_path
+    from freetoken.moe.gguf_experts import GGUF_EXPERT_QUANTS
+
+    if not is_gguf_path(config.model_path):
+        return False
+    fmt = getattr(config.model_config, "expert_quant", None) or ""
+    return fmt.split("+", 1)[0] in GGUF_EXPERT_QUANTS
+
+
+def _select_expert_source(config: EngineConfig, *, reserved: int, method=None) -> str:
+    """Resolve --expert-source into the loader mode ("pinned" or "mmap").
+
+    "auto" keeps the pinned path while the banks fit the pin budget and falls back to a
+    repacked mmap store when they do not (erroring with the repack command when no store
+    exists). "pinned" keeps the old pre-load budget check; "mmap" requires a store.
+    """
+    from freetoken.moe.expert_store import is_expert_store
+
+    requested = config.expert_source
+    store_dir = _store_dir_for(config)
+    if requested == "mmap":
+        if not is_expert_store(store_dir):
+            remedy = (
+                f"build one with `ft experts repack {config.model_path} --out {store_dir}`"
+                if _repackable_for_mmap(config)
+                else f"the disk-backed source only supports native-GGUF experts; {_pin_hint(reserved)}"
+            )
+            raise ValueError(f"--expert-source mmap needs an expert store at {store_dir!r}; {remedy}")
+        return "mmap"
+    if config.moe_cpu_layers or config.moe_strategy not in ("offload", "hybrid"):
+        return "pinned"  # split residency / non-offload strategies keep the pinned path
+    if requested == "pinned":
+        _check_pin_budget(config, reserved=reserved, method=method)
+        return "pinned"
+    budget = _pin_budget_bytes(reserved)
+    bank_bytes = _bank_bytes(config, method) if budget is not None else None
+    if bank_bytes and bank_bytes > budget:
+        if is_expert_store(store_dir):
+            logger.info_rank0(
+                f"expert banks {bank_bytes / 2**30:.2f} GiB exceed the pin budget "
+                f"{budget / 2**30:.2f} GiB; serving from the mmap expert store {store_dir}"
+            )
+            return "mmap"
+        base = (
+            f"expert banks need {bank_bytes / 2**30:.1f} GiB of pinned host RAM but the pin "
+            f"budget is {budget / 2**30:.1f} GiB; "
+        )
+        if _repackable_for_mmap(config):
+            raise ValueError(
+                base
+                + f"repack them for the disk-backed mmap source with "
+                f"`ft experts repack {config.model_path} --out {store_dir}`, or {_pin_hint(reserved)}"
+            )
+        raise ValueError(base + _pin_hint(reserved))
+    return "pinned"
+
+
+def _resolve_expert_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> int:
+    """Bytes to pin for the usage-ranked warm subset.
+
+    Explicit --expert-pin-budget / --expert-pin-fraction win; the default fills the pin
+    budget minus the staging ring (the ring is pinned, so it is carved out first).
+    """
+    budget = _pin_budget_bytes(reserved) or 0
+    if config.expert_pin_budget is not None:
+        want = int(config.expert_pin_budget * 2**30)
+    elif config.expert_pin_fraction is not None:
+        want = int(budget * config.expert_pin_fraction)
+    else:
+        want = budget
+    bank_bytes = _bank_bytes(config, method) or 0
+    layers = getattr(config.model_config, "num_moe_layers", 0)
+    experts = getattr(config.model_config, "num_experts", 0)
+    ring_rows = max(1, int(os.environ.get("FREETOKEN_EXPERT_RING_ROWS", "8")))
+    ring_bytes = ring_rows * bank_bytes // (layers * experts) if layers and experts else 0
+    return max(0, want - ring_bytes)
+
+
+def _finish_mmap_source(config: EngineConfig, cache) -> None:
+    """Disable decode CUDA graphs and attach the usage-ranked prefetch plan.
+
+    The staged H2D path runs host code (ring fill + a num_indices sync) that a captured
+    graph would execute only at capture time, so staged decode must run eagerly.
+    """
+    from freetoken.moe.usage import load_usage, prefetch_plan
+
+    if config.cuda_graph_max_bs != 0:
+        logger.info_rank0("mmap expert source: disabling CUDA graphs (staged H2D is host-driven)")
+    object.__setattr__(config, "cuda_graph_bs", [])
+    object.__setattr__(config, "cuda_graph_max_bs", 0)
+    if config.expert_usage_file:
+        usage = load_usage(config.expert_usage_file)
+        if usage is not None:
+            top_n = max(1, int(os.environ.get("FREETOKEN_EXPERT_PREFETCH", "4")))
+            cache.usage_prefetch = prefetch_plan(usage, top_n)
+            logger.info_rank0(
+                f"mmap expert source: prefetching top-{top_n} experts per layer from "
+                f"{config.expert_usage_file}"
+            )
+
+
 def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:
     """Pick CPU (locked) MoE layers for ``--moe-cpu-layers auto``: none while the banks fit the pin budget.
 
@@ -1425,6 +1545,12 @@ _DENSE_MOE_SETTINGS = {
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
+    "expert_source": "auto",
+    "expert_store": None,
+    "expert_usage_file": None,
+    "expert_pin_budget": None,
+    "expert_pin_fraction": None,
+    "moe_collect_stats": False,
 }
 
 
@@ -1785,6 +1911,13 @@ def _adjust_config(config: EngineConfig):
     if is_moe and config.moe_cpu_layers and config.moe_cpu_layers.strip() != "auto":
         if not _parse_cpu_layers_spec(config.moe_cpu_layers, model_config.num_moe_layers):
             override("moe_cpu_layers", None)
+
+    if is_moe and getattr(config, "expert_pin_budget", None) is not None and getattr(config, "expert_pin_fraction", None) is not None:
+        raise ValueError(
+            "--expert-pin-budget and --expert-pin-fraction are mutually exclusive"
+        )
+    if is_moe and getattr(config, "expert_pin_budget", None) is not None and config.expert_pin_budget < 0:
+        raise ValueError("--expert-pin-budget must be >= 0")
 
     if is_moe:
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)
