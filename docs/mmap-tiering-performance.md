@@ -83,6 +83,18 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
   information, so it guarantees residency of the retained set rather than a ranking; when
   `--expert-usage-file` is also given, the warm file still sets the pin plan and the usage
   file drives prefetch. Budget leftover after the plan is not spent on unplanned experts.
+  **Caveat (observed): a large pin starves the page cache the whole-layer prefill reads, which
+  made this host much slower - see "F caveat" under Suggested fixes and size the pin
+  deliberately.**
+- **G - implemented (wiring + bug fix).** `ft experts stats` now forwards
+  `--expert-source` / `--expert-store` / `--expert-warm` and `--ple-source` / `--ple-backend`
+  into the calibration `LLM(...)` (`experts/__main__.py`), so a split GGUF can calibrate
+  straight from its mmap store with its external PLE table instead of failing on the missing
+  default `<shard>.experts` path. Adding the CLI test
+  (`tests/moe/test_expert_store.py`) caught a latent bug: it passed
+  `SamplingParams(max_new_tokens=...)`, which is now mapped to `max_tokens`. Still open: the
+  offline pass runs eagerly (slow until D/E), and the live histogram is not wired to
+  `--moe-collect-stats`.
 
 Local C A/B against the real store (`layer-000`, `gate_up`, cache_size 512, ring rows 8,
 `--legacy`, page-warm, 21 reps). Only the chunked cases move; a single-chunk layer is
@@ -276,18 +288,64 @@ wrong, and it carries no frequency information, so it mostly guarantees residenc
 experts rather than optimal ranking. It also does not fix #1/#3, so it is a complement, not a
 substitute.
 
+### F caveat. A large pin competes with the page cache prefill needs (observed)
+
+`--expert-warm-file` is a residency prior, and on this host a large one is actively harmful
+because the **whole-layer prefill path does not read the pinned subset**. `copy_missing`'s
+`_pending_whole_layer` branch `MADV_WILLNEED`s the bank and then copies `per_layer[layer_id]`
+- the **mmap view** - into the slot cache (`moe/offload_cache.py:1309-1318`). Only the staged
+*decode* path consults the pins (`_copy_missing_staged` -> `read_rows_into`,
+`offload_cache.py:1279-1284`). Every pinned byte is therefore a byte the page cache cannot use
+for the very pages prefill reads.
+
+Observed with the REAP top-384 plan on this 62 GiB host (store 62.4 GiB):
+
+- `expert store: pinned warm subset 17858 experts (44.28 GiB)` (budget-capped; ~49 GiB was
+  available because `_pin_budget_bytes` is 90% of `MemAvailable`).
+- The store was largely page-cache resident before the run - the `Free memory before loading
+  model: 15.38 GiB` line means MemAvailable was mostly reclaimable cache.
+- Building the pinned subset evicted that cache, so every prefill re-read whole layers cold:
+  `input throughput` 0.10-0.36 tok/s and clients timing out before a single token (the HTTP
+  200 is the SSE response starting; tokens never arrive for minutes).
+- Adding `--expert-warm` (warm cache first, then pin) was better than without it but still far
+  worse than no pinning; removing `--expert-warm-file` restored the previous
+  slow-but-responsive behaviour.
+
+Guidance until the prefill path is made pin-aware or D/E removes the whole-layer PCIe stream:
+
+- Prefer the page cache over pins: `--expert-source mmap --expert-warm`, with no
+  `--expert-warm-file` and no `--expert-usage-file`.
+- If pinning, size it so the cache keeps room: `--expert-pin-fraction 0.1` /
+  `--expert-pin-budget 5`, not the ~44 GiB default.
+- To use a G usage file for prefetch but not its pins, zero the budget:
+  `--expert-usage-file <usage.json> --expert-pin-fraction 0` (`select_pins` returns empty, but
+  `_finish_mmap_source` still attaches the ranked one-layer prefetch).
+- Real fix: make the whole-layer prefill copy pinned rows from their pinned buffer and mmap
+  only the non-pinned remainder (a small `copy_missing` change), or D/E.
+
 ### G. Calibration usage file (`ft experts stats`) - Impact Med, Effort S to run
+_(implemented: store-flag forwarding + a latent `max_tokens` fix + a CLI test; see Status)_
+G and F feed the same pin/prefetch policy but are not interchangeable: F is an unranked
+retained set (residency only), while the usage file is frequency-ranked and is the only source
+of the one-layer-ahead prefetch plan (`usage.prefetch_plan`). With both given, the warm file
+sets the pins and the usage file drives prefetch. A usage file also lets you get prefetch
+without pins via `--expert-pin-fraction 0` (see the "F caveat").
 The documented M3 path works, with two caveats found in the code:
 - `ft experts stats` does not forward `--expert-source`/`--expert-store`
   (`experts/__main__.py:50-57`). For this model the auto path would raise the pin-budget error
   unless `FREETOKEN_EXPERT_STORE` points at the store (then it auto-selects mmap). Small
-  improvement: add `--expert-store`/`--expert-source` to the subcommand.
+  improvement: add `--expert-store`/`--expert-source` to the subcommand. **Done** (also
+  `--expert-warm` and `--ple-source`/`--ple-backend`; this model needs the external PLE
+  table); they are now passed to the calibration `LLM(...)`.
 - It runs the model eagerly, so it is as slow as serving until A/B are fixed. Run it after A
-  (and with a short `--max-new-tokens`) or rely on F.
+  (and with a short `--max-new-tokens`) or rely on F. Still true: the offline pass is eager.
 - The live counters cannot replace it: `--moe-collect-stats` accumulates only `lru_stats`
   (miss rate), the per-`(layer, expert)` histogram needs `collect_decode_freq` set
   programmatically and has no dump endpoint (`docs/gguf.md:126-129`), so the offline pass is
-  the only route. It also has no test coverage (`docs/gguf.md:138-139`).
+  the only route. It also has no test coverage (`docs/gguf.md:138-139`). **Coverage added**:
+  a CLI test pins the forwarded flags, and it exposed a latent
+  `SamplingParams(max_new_tokens=...)` TypeError (the flag is now mapped to `max_tokens`), so
+  the command was unusable before this fix. The live-histogram dump remains open.
 The output improves hit rate and overlap, not raw cold-read volume.
 
 ### H. Make staged decode graph-capturable - Impact Med-High, Effort L
@@ -337,12 +395,15 @@ is host-side and only meaningful once #1/#3 are fixed.
 
 ## Answers to the specific questions
 
-**Will a starting expert set help? Yes.**
+**Will a starting expert set help? Yes, with a caveat.**
 The REAP JSON (F) is a good zero-cost warm/pin set (384 of 512 fits the pin budget), and it
 avoids the slow calibration run. Residency does not help while cold experts cost 4 KiB faults
 (A) or while the staged copy syncs per layer (C) - fix those first, then F. A, C and F are
 now implemented: pass `--expert-warm-file docs/qwen3.8-flash-next-top-384-experts-according-to-sh0wie.json`
-with `--expert-source mmap`.
+with `--expert-source mmap`. But a full-size pin (44 GiB here) evicts the page cache the
+whole-layer prefill path reads and makes serving much slower; on this 62 GiB host prefer
+`--expert-warm` with no pin, a small `--expert-pin-fraction`, or a pin-aware prefill (see the
+"F caveat" above).
 
 **`--moe-strategy cpu` / hybrid: worth unblocking?**
 Yes, probably the largest steady-state win here, because it removes the PCIe term (root cause
@@ -405,7 +466,8 @@ surfaces:
 - `:130-132` the mmap store is native-GGUF only and needs contiguous expert layers -> D/E
   scope.
 - `:136-137` prefetch depth and ring rows are env-only, with no CLI flags -> N.
-- `:138-139` `ft experts stats` runs the full model eagerly and has no test coverage -> G.
+- `:138-139` `ft experts stats` still runs the full model eagerly; its store/PLE flag
+  forwarding and a `max_tokens` fix landed, with CLI coverage -> G.
 - `:149-152` CPU Q5_K GEMV redundantly recomputes the per-32 activation sum per output row
   (`gguf_asum32`). Not on this model's formats (gate/up IQ4_XS, down IQ4_NL), but relevant if
   E is later extended to Q5_K.
@@ -418,7 +480,8 @@ surfaces:
 3. C (batched staged copy, one sync/layer) + I (current-layer prefetch) + N (flags/warning so
    the A/B runs are reproducible). _C done; I and N remain._
 4. F (REAP-seeded warm set) or G (stats) - residency/prefetch. _F done
-   (`--expert-warm-file`); G still needs the offline `ft experts stats` pass._
+   (`--expert-warm-file`); G's store-flag forwarding + test done, the eager calibration run
+   remains slow until D/E._
 5. E + D (composite CPU ext, then CPU/hybrid over the mmap store) - the big architectural win.
 6. H, J, K as follow-ups.
 
@@ -469,6 +532,15 @@ See `docs/mmap-tiering-performance.md` for the full status and numbers.
   `FREETOKEN_EXPERT_WARM_FILE` accepts a retained-expert plan (JSON `layer -> [expert ids]`,
   e.g. the REAP top-384 dump) and pins those experts per layer, budget-capped, with no
   `ft experts stats` run. A usage file can still be passed alongside to drive prefetch.
+- **Calibration run usable on the store (G, done):** `ft experts stats` forwards
+  `--expert-source` / `--expert-store` / `--expert-warm` and `--ple-source` / `--ple-backend`
+  to the calibration model and maps its `--max-new-tokens` to `SamplingParams.max_tokens` (a
+  latent TypeError is fixed). Its output feeds `--expert-usage-file` for a ranked pin set plus
+  one-layer prefetch.
+- **Pinning vs page cache (operational):** the whole-layer prefill path reads the mmap views,
+  not the pinned buffers, so a large pin (44 GiB here) evicts the cache prefill needs and makes
+  serving much slower - see the "F caveat" under Suggested fixes. Prefer `--expert-warm` with
+  no pin or a small `--expert-pin-fraction` until the prefill path is pin-aware or D/E lands.
 - **Still open:** `--moe-strategy cpu`/hybrid is blocked on composite `iq4_xs+iq4_nl`
   support in the CPU MoE extension (E) plus wiring the mmap source to the CPU executor (D);
   that removes the PCIe term and is the big architectural win.

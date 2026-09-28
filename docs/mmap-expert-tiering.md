@@ -91,8 +91,10 @@ Two implementations:
 - **Usage ranking**: extend the existing `--moe-collect-stats` counters (currently
   miss-rate only) to per-`(layer, expert)` activation counts, and/or add an offline pass
   `ft experts stats --model <gguf> --calib <text>` that writes a usage file consumed by
-  `--expert-usage-file`. Absent a usage file, fall back to LRU (the page cache and slot cache
-  already approximate it).
+  `--expert-usage-file`. The stats pass accepts `--expert-source` / `--expert-store` /
+  `--expert-warm` plus `--ple-source` / `--ple-backend`, so a split qwen4exp GGUF can calibrate
+  straight from its mmap store and external PLE table. Absent a usage
+  file, fall back to LRU (the page cache and slot cache already approximate it).
 - **Retained-expert prior**: `--expert-warm-file` takes a JSON `layer -> [expert ids]` plan
   (e.g. a REAP top-K dump such as
   `docs/qwen3.8-flash-next-top-384-experts-according-to-sh0wie.json`) and pins exactly those
@@ -100,7 +102,9 @@ Two implementations:
   information, so it guarantees residency of the retained set rather than optimal ranking;
   when both flags are given the warm file sets the pin plan and the usage file drives
   prefetch. This is the cheapest way to seed the warm tier (F in
-  `mmap-tiering-performance.md`).
+  `mmap-tiering-performance.md`). **Caution:** the whole-layer prefill path reads the mmap
+  views, not the pins, so a large pin evicts the page cache prefill needs and can make serving
+  much slower on a RAM-tight host; size it with `--expert-pin-fraction` or start with no pin.
 - **Prefetch**: `madvise(MADV_WILLNEED)` the next layer's likely experts (from the usage
   file) before the current layer's GEMM, so prefill overlaps I/O with compute.
 
@@ -171,8 +175,11 @@ Two implementations:
 
 ## Risks
 
-- Page-cache reclaim/thrash if the working set approaches RAM; mitigate with the pinned warm
-  subset and usage-ranked prefetch.
+- Page-cache reclaim/thrash if the working set approaches RAM. The pinned warm subset is not
+  a substitute for the page cache on the mmap path: the whole-layer prefill copy reads the
+  mmap views, not the pins, so pinning large took the cache prefill needed on a 62 GiB host
+  and made serving much slower (see the "F caveat" in `mmap-tiering-performance.md`). Prefer
+  `--expert-warm` and a small pin until the prefill path is pin-aware or D/E.
 - H2D from pageable memory is slower than pinned; mitigated by the staging ring.
 - Cold prefill reads a lot once (a long prompt can touch ~40 GB); page cache persists across
   requests, and prefetch hides some of it.
@@ -219,7 +226,8 @@ Behaviour to expect:
 
 - **Staged decode runs eagerly**: the mmap source logs
   `mmap expert source: disabling CUDA graphs (staged H2D is host-driven)`. This is v1's
-  correctness-first tradeoff; `ft experts stats` + the pinned warm subset recover speed.
+  correctness-first tradeoff; decode stays eager until D/E (or H). Pinning helps only the
+  staged decode path, not the whole-layer prefill (see the pin caveat below).
 - **Cold experts are read whole**: the staged ring fill (and the pinned-subset build) issues
   one buffered `preadv` per expert instead of faulting the mmap one 4 KiB page at a time
   under `MADV_RANDOM`; the whole-layer prefill path `MADV_WILLNEED`s the bank first.
@@ -230,9 +238,16 @@ Behaviour to expect:
   model it resolved `moe_cache_size=2232` and left ~1.5 GiB free. If decode OOMs, pass an
   explicit `--moe-cache-size` (e.g. 1536) instead.
 - **No usage file -> no explicit pinning or prefetch**: the page cache and LRU only. Run
-  `ft experts stats --model <model.gguf> --calib <text>` to write one, then add
-  `--expert-usage-file <usage.json>`. For a zero-calibration warm set, pass
-  `--expert-warm-file <reap-top-k.json>` instead: it pins the retained experts per layer,
-  budget-capped, and leaves the rest to the page cache.
+  `ft experts stats --model <model.gguf> --calib <text> --expert-source mmap --expert-store
+  <store> --expert-warm --ple-source <fp8-ple>` to write one, then add `--expert-usage-file
+  <usage.json>`. For a zero-calibration warm set, pass `--expert-warm-file <reap-top-k.json>`
+  instead: it pins the retained experts per layer, budget-capped, and leaves the rest to the
+  page cache.
+- **A large pin can be slower than no pin on a RAM-tight host**: the whole-layer prefill copy
+  reads the mmap views, not the pins, so a ~44 GiB REAP pin evicted the page cache prefill
+  needed on a 62 GiB host (prefill fell to 0.10-0.36 tok/s). Prefer `--expert-warm` with no pin
+  file, cap the pin with `--expert-pin-fraction`, or use `--expert-usage-file <usage.json>
+  --expert-pin-fraction 0` for prefetch without pins. See the "F caveat" in
+  [mmap-tiering-performance.md](mmap-tiering-performance.md).
 - **`--expert-source auto` (default)** picks mmap when the banks exceed the pin budget and a
   store exists; without a store it fails with the `ft experts repack` command to run.

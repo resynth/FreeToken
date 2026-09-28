@@ -57,6 +57,12 @@ expert plan (a JSON `layer -> [expert ids]`, e.g. the REAP top-K dump shipped as
 `docs/qwen3.8-flash-next-top-384-experts-according-to-sh0wie.json`): the listed experts are
 pinned per layer, budget-capped, and the rest fall back to the page cache. Both can be
 combined - the warm file sets the pin plan while the usage file still drives prefetch.
+
+Caution: the whole-layer prefill path copies the mmap views, not the pinned buffers, so a
+large pin trades away the page cache prefill depends on. On a 62 GiB host a full REAP pin
+(~44 GiB) makes prefill much slower; prefer `--expert-warm` with no pin file, or cap the pin
+with `--expert-pin-fraction`. See the "F caveat" in
+[mmap-tiering-performance.md](mmap-tiering-performance.md).
 Without either, an oversized model still stops with a clear error instead of OOM-crashing the
 host.
 
@@ -89,14 +95,19 @@ To serve the 512-expert IQ4_XS GGUF on a ~62 GiB host (banks exceed the pin budg
 ```
 ft experts repack <gguf> --out <store> --drop-ple
 ft serve --model <gguf> --ple-source Saren/Qwen3.8-Flash-Next-ple-table-fp8 \
-    --expert-source mmap --expert-store <store> --moe-cache-auto \
-    --expert-warm-file docs/qwen3.8-flash-next-top-384-experts-according-to-sh0wie.json
+    --expert-source mmap --expert-store <store> --moe-cache-auto --expert-warm
 ```
 See [mmap-expert-tiering.md](mmap-expert-tiering.md) "Running with the store": staged decode
-is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs. The warm file
-pins the REAP-retained 384 experts per layer (45.7 GiB, inside the ~51 GiB pin budget) with
-no calibration run; an `--expert-usage-file` from `ft experts stats` can still be added for a
-ranked prefetch.
+is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs. `--expert-warm`
+pre-loads the store into the page cache, which is the warm tier the whole-layer prefill reads.
+
+Pinning is optional and, on this host, a large pin hurts: `--expert-warm-file` pins the
+REAP-retained 384/layer (45.7 GiB) and `--expert-usage-file` (from `ft experts stats`) pins a
+usage-ranked set, but both evict the page cache prefill needs. Start without either, or cap the
+pin with `--expert-pin-fraction`; to calibrate, run `ft experts stats --model <gguf> --calib
+<text> --out <usage.json> --expert-source mmap --expert-store <store> --expert-warm
+--ple-source <fp8-ple>`. Details and the measured diagnosis are in the "F caveat" of
+[mmap-tiering-performance.md](mmap-tiering-performance.md).
 
 ## Verification
 
@@ -151,8 +162,13 @@ ranked prefetch.
     from a different checkpoint is accepted silently.
   - Prefetch depth (`FREETOKEN_EXPERT_PREFETCH`) and ring rows
     (`FREETOKEN_EXPERT_RING_ROWS`) are env-only, with no CLI flags.
-  - `ft experts stats` runs the full model eagerly and has no test coverage (needs a real
-    checkpoint).
+- `ft experts stats` now forwards `--expert-source` / `--expert-store` / `--expert-warm` and
+  `--ple-source` / `--ple-backend` to the calibration model (a split GGUF's store is not at
+  the default `<shard>.experts` path, and qwen4exp needs its external fp8 PLE table), and its
+  `--max-new-tokens` is mapped to `SamplingParams.max_tokens` (it previously raised a
+  TypeError). It still runs the full model eagerly, so it is slow until D/E; its CLI-level
+  test coverage is now in `tests/moe/test_expert_store.py`.
+
   - Online adaptive re-pinning (calibration/production drift detection) stays out of scope
     for v1 per `mmap-expert-tiering.md`, gated on per-layer telemetry showing divergence.
 - Expert format must be uniform across layers (one tag per model). Unsloth "dynamic" quants

@@ -54,6 +54,13 @@ def _stats(args: argparse.Namespace) -> int:
         moe_collect_stats=True,
         cuda_graph_bs=[],
         cuda_graph_max_bs=0,
+        # Forwarded so calibration can use the mmap store; a split GGUF's store is not at
+        # the default `<shard>.experts` path, so the auto path would otherwise error.
+        expert_source=args.expert_source,
+        expert_store=args.expert_store,
+        expert_warm=args.expert_warm,
+        ple_source=args.ple_source,
+        ple_backend=args.ple_backend,
     )
     cache = getattr(llm.engine, "moe_offload_cache", None)
     if cache is None:
@@ -62,7 +69,7 @@ def _stats(args: argparse.Namespace) -> int:
     # The routing histogram is host-accumulated before the LRU kernel rewrites ids, so it
     # is only accurate without a captured decode graph (which is why graphs are disabled).
     cache.collect_decode_freq = True
-    sampling = SamplingParams(temperature=0.0, max_new_tokens=args.max_new_tokens, ignore_eos=True)
+    sampling = SamplingParams(temperature=0.0, max_tokens=args.max_new_tokens, ignore_eos=True)
     llm.generate([text], sampling)
     usage = UsageData.from_freq(cache.decode_freq, source=args.calib)
     out = args.out or (args.model + ".usage.json")
@@ -72,7 +79,10 @@ def _stats(args: argparse.Namespace) -> int:
         f"wrote {out}: {usage.num_layers} layers x {usage.num_experts} experts, "
         f"{sum(totals)} routed activations"
     )
-    print(f"serve with: --expert-usage-file {out} --expert-source mmap")
+    hint = f"--expert-usage-file {out} --expert-source mmap"
+    if args.expert_store:
+        hint += f" --expert-store {args.expert_store}"
+    print(f"serve with: {hint}")
     return 0
 
 
@@ -114,6 +124,37 @@ def main(argv: list[str] | None = None, prog: str = "ft experts") -> int:
         p.add_argument("--out", default=None, help="usage file to write (default <model>.usage.json)")
         p.add_argument("--max-new-tokens", type=int, default=128, help="decode tokens to run")
         p.add_argument("--dtype", default="bfloat16", help="model dtype (default bfloat16)")
+        p.add_argument(
+            "--expert-source",
+            default="auto",
+            choices=("auto", "pinned", "mmap"),
+            help="Expert source for the calibration run (as `ft serve --expert-source`); "
+                 "'auto' serves a repacked store when the banks exceed the pin budget.",
+        )
+        p.add_argument(
+            "--expert-store",
+            default=None,
+            help="Repacked expert store for the calibration run; needed for a split GGUF "
+                 "whose store is not at the default `<shard>.experts` path.",
+        )
+        p.add_argument(
+            "--expert-warm",
+            action="store_true",
+            help="Sequentially read the whole store once before calibrating (page-cache warm), "
+                 "so the routed prefill reads resident pages.",
+        )
+        p.add_argument(
+            "--ple-source",
+            default=None,
+            help="External fp8 PLE table (repo id or dir), as `ft serve --ple-source`; required "
+                 "by qwen4exp GGUFs that do not carry the table inline.",
+        )
+        p.add_argument(
+            "--ple-backend",
+            default="disk",
+            choices=("disk", "pinned"),
+            help="PLE backend for the calibration run (default disk).",
+        )
         _add_common(p)
         return _stats(p.parse_args(rest))
     print(f"unknown ft experts subcommand: {sub}", file=sys.stderr)

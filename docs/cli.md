@@ -90,7 +90,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--expert-source` | auto | Where expert rows live: `auto` pins them when they fit the host pin budget, else serves a repacked mmap store; `pinned` keeps the old budget error; `mmap` always uses the store |
 | `--expert-store` | alongside the checkpoint | Repacked expert-store dir for `--expert-source mmap` (`<model>.experts` for a GGUF, `<dir>/experts` for a dir); built with `ft experts repack` |
 | `--expert-usage-file` | — | Per-`(layer, expert)` routing counts from `ft experts stats`; with mmap the top experts per layer are pinned and prefetched |
-| `--expert-warm-file` | — | Retained-expert plan for the mmap source: a JSON `layer -> [expert ids]` (e.g. a REAP top-K dump) pinned per layer with no calibration run, budget-capped; `--expert-usage-file` still drives prefetch when both are given |
+| `--expert-warm-file` | — | Retained-expert plan for the mmap source: a JSON `layer -> [expert ids]` (e.g. a REAP top-K dump) pinned per layer with no calibration run, budget-capped; `--expert-usage-file` still drives prefetch when both are given. A large pin can starve the page cache the whole-layer prefill reads - see the "F caveat" in `mmap-tiering-performance.md` |
 | `--expert-pin-budget` / `--expert-pin-fraction` | pin budget minus the ring | Host RAM pinned for the usage-ranked warm subset (GiB / fraction of the pin budget; mutually exclusive) |
 | `--expert-warm` | off | With an mmap source, sequentially read the whole store once at startup so the page cache is warm before the first request (`FREETOKEN_EXPERT_WARM=1` does the same) |
 | `--moe-collect-stats` | off | Accumulate decode miss-rate and per-expert routing counters for `ft ctl` / `ft experts stats` |

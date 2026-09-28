@@ -424,6 +424,44 @@ def test_parse_args_exposes_the_expert_flags(monkeypatch):
     assert args.moe_collect_stats is True
 
 
+def test_experts_stats_forwards_the_store_flags(monkeypatch, tmp_path):
+    import freetoken.experts.__main__ as experts_cli
+
+    seen: dict = {}
+
+    class _Cache:
+        collect_decode_freq = False
+        decode_freq = torch.zeros((1, 2), dtype=torch.int64)
+
+    class _LLM:
+        def __init__(self, model_path, **kwargs):
+            seen["model_path"] = model_path
+            seen.update(kwargs)
+            self.engine = SimpleNamespace(moe_offload_cache=_Cache())
+
+        def generate(self, prompts, sampling_params):
+            return [{"text": ""}]
+
+    monkeypatch.setattr("freetoken.llm.LLM", _LLM)
+    monkeypatch.setattr("freetoken.gpu_select.assign_gpu", lambda gpu: None)
+    monkeypatch.setattr("freetoken.gpu_select.bind_assigned_gpu", lambda: None)
+    calib = tmp_path / "calib.txt"
+    calib.write_text("hello")
+    out = tmp_path / "usage.json"
+    rc = experts_cli.main([
+        "stats", "--model", "m.gguf", "--calib", str(calib), "--out", str(out),
+        "--expert-source", "mmap", "--expert-store", "/tmp/store", "--expert-warm",
+        "--ple-source", "/tmp/ple",
+    ])
+    assert rc == 0
+    assert seen["expert_source"] == "mmap"
+    assert seen["expert_store"] == "/tmp/store"
+    assert seen["expert_warm"] is True
+    assert seen["ple_source"] == "/tmp/ple"
+    assert seen["moe_collect_stats"] is True
+    assert out.exists()
+
+
 def test_select_expert_source_pinned_matches_the_fit(monkeypatch, tmp_path):
     from freetoken.engine.engine import _select_expert_source
 
