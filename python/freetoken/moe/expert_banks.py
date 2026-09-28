@@ -312,6 +312,7 @@ def _store_expert_banks(
     store_dir: str,
     usage_file: str | None,
     pin_budget_bytes: int,
+    warm: bool = False,
 ) -> ExpertBanks:
     """Load an expert store through the mmap source, optionally pinning a usage-ranked subset."""
     from freetoken.moe.expert_source import MmapExpertSource
@@ -361,7 +362,7 @@ def _store_expert_banks(
             usage, num_experts=num_experts,
             expert_bytes=index.expert_bytes(), budget_bytes=pin_budget_bytes,
         )
-    source = MmapExpertSource.open(store_dir, pin_plan=pin_plan)
+    source = MmapExpertSource.open(store_dir, pin_plan=pin_plan, warm=warm)
     pinned_experts = sum(len(v) for v in pin_plan.values())
     if pinned_experts:
         logger.info_rank0(
@@ -399,6 +400,7 @@ def load_expert_banks(
     expert_store: str | None = None,
     expert_usage_file: str | None = None,
     expert_pin_budget_bytes: int = 0,
+    expert_warm: bool = False,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -435,9 +437,14 @@ def load_expert_banks(
                 "--expert-source mmap needs an expert store; pass --expert-store <dir> "
                 "or run `ft experts repack <gguf> --out <dir>`"
             )
+        if not expert_warm:
+            expert_warm = os.environ.get("FREETOKEN_EXPERT_WARM", "").strip().lower() in (
+                "1", "true", "yes", "on",
+            )
         return _store_expert_banks(
             model_path, model_config, store_dir=store_dir,
             usage_file=expert_usage_file, pin_budget_bytes=expert_pin_budget_bytes,
+            warm=expert_warm,
         )
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:

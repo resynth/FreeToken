@@ -65,6 +65,10 @@ class EngineConfig:
     expert_usage_file: str | None = None
     expert_pin_budget: float | None = None
     expert_pin_fraction: float | None = None
+    # --expert-warm: before serving, sequentially read the whole mmap store once so its
+    # pages are resident (page cache = warm tier). Cut from ~15 min of 4 KiB faults to a
+    # one-off sequential read; FREETOKEN_EXPERT_WARM=1 is the env fallback.
+    expert_warm: bool = False
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

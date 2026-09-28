@@ -339,6 +339,7 @@ def test_parse_args_exposes_the_expert_flags(monkeypatch):
             "--expert-store", "/tmp/store",
             "--expert-usage-file", "/tmp/u.json",
             "--expert-pin-budget", "4",
+            "--expert-warm",
             "--moe-collect-stats",
         ])
     assert args.expert_source == "mmap"
@@ -346,6 +347,7 @@ def test_parse_args_exposes_the_expert_flags(monkeypatch):
     assert args.expert_usage_file == "/tmp/u.json"
     assert args.expert_pin_budget == 4.0
     assert args.expert_pin_fraction is None
+    assert args.expert_warm is True
     assert args.moe_collect_stats is True
 
 
@@ -362,3 +364,54 @@ def test_select_expert_source_pinned_matches_the_fit(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", "8")
     assert _select_expert_source(cfg, reserved=0) == "pinned"
+
+
+def test_read_rows_into_matches_the_store(monkeypatch, tmp_path):
+    from freetoken.moe.expert_source import MmapExpertSource
+
+    E, H, I, L = 5, 64, 32, 2
+    index = _repack(monkeypatch, _fused_tensors(L, E, H, I), tmp_path)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    source = MmapExpertSource.open(str(tmp_path), pin_plan={0: [4, 1]})
+    ids = [4, 0, 2, 1, 3]
+    for layer in range(L):
+        for role in ("gate_up", "down"):
+            loc = index.location(layer, role)
+            view = source.layer_views(layer)[role]
+            dst = torch.empty((len(ids), loc.rows, loc.row_bytes), dtype=torch.uint8)
+            pinned = source.read_rows_into(layer, role, ids, dst)
+            for i, expert in enumerate(ids):
+                assert torch.equal(dst[i], view[expert])
+            assert pinned == (2 if layer == 0 else 0)
+    source.close()
+
+
+def test_read_rows_into_rejects_a_wrong_sized_destination(monkeypatch, tmp_path):
+    from freetoken.moe.expert_source import MmapExpertSource
+
+    index = _repack(monkeypatch, _fused_tensors(1, 2, 64, 32), tmp_path)
+    source = MmapExpertSource.open(str(tmp_path))
+    loc = index.location(0, "gate_up")
+    with pytest.raises(ValueError, match="rows"):
+        source.read_rows_into(0, "gate_up", [0, 1], torch.empty((1, loc.rows, loc.row_bytes), dtype=torch.uint8))
+    source.close()
+
+
+def test_warm_cache_reads_every_bank(monkeypatch, tmp_path):
+    from freetoken.moe.expert_source import MmapExpertSource
+
+    E, H, I, L = 3, 64, 32, 2
+    index = _repack(monkeypatch, _fused_tensors(L, E, H, I), tmp_path)
+    want = sum(
+        index.num_experts * index.location(layer, role).stride
+        for layer in range(L)
+        for role in ("gate_up", "down")
+    )
+    source = MmapExpertSource.open(str(tmp_path))
+    assert source.warm_cache(workers=2) == want
+    # warming is also reachable through open(warm=True)
+    warmed = MmapExpertSource.open(str(tmp_path), warm=True)
+    assert warmed.warm_cache(workers=1) == want
+    source.close()
+    warmed.close()
+

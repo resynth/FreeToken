@@ -716,6 +716,18 @@ def parse_args(
         help="Fraction of the host pin budget to use for the warm subset (mmap source).",
     )
 
+    parser.add_argument(
+        "--expert-warm",
+        action="store_true",
+        default=ServerArgs.expert_warm,
+        help=(
+            "With an mmap source, sequentially read the whole expert store once at startup "
+            "so its pages are resident in the page cache before the first request. Turns "
+            "the first token/prefill from on-demand 4 KiB faults into one sequential read "
+            "(FREETOKEN_EXPERT_WARM=1 does the same)."
+        ),
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",

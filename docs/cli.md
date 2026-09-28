@@ -91,6 +91,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--expert-store` | alongside the checkpoint | Repacked expert-store dir for `--expert-source mmap` (`<model>.experts` for a GGUF, `<dir>/experts` for a dir); built with `ft experts repack` |
 | `--expert-usage-file` | — | Per-`(layer, expert)` routing counts from `ft experts stats`; with mmap the top experts per layer are pinned and prefetched |
 | `--expert-pin-budget` / `--expert-pin-fraction` | pin budget minus the ring | Host RAM pinned for the usage-ranked warm subset (GiB / fraction of the pin budget; mutually exclusive) |
+| `--expert-warm` | off | With an mmap source, sequentially read the whole store once at startup so the page cache is warm before the first request (`FREETOKEN_EXPERT_WARM=1` does the same) |
 | `--moe-collect-stats` | off | Accumulate decode miss-rate and per-expert routing counters for `ft ctl` / `ft experts stats` |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |

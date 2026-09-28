@@ -1196,24 +1196,34 @@ class OffloadMoeCache:
         self._ensure_staging()
         evict = self.evict_slots[:n]
         src_ids = self.src_indices[:n].cpu().tolist()
+        source = self.expert_source
+        read_rows = getattr(source, "read_rows_into", None)
         for role, (per_layer, cache) in zip(self.bank_schema, self.banks):
             ring = self._staging_ring[role]
             device = self._staging_device[role]
             rows = ring.shape[0]
             for start in range(0, n, rows):
                 m = min(rows, n - start)
-                for c in range(m):
-                    expert = int(src_ids[start + c])
-                    if self.expert_source is not None:
-                        row = self.expert_source.warm_row(layer_id, role, expert)
-                        is_pinned = getattr(self.expert_source, "is_pinned_row", None)
-                        if is_pinned is None or is_pinned(layer_id, role, expert):
-                            self.staged_pinned_layer[layer_id] += 1
+                chunk = src_ids[start : start + m]
+                if read_rows is not None:
+                    # mmap source: one buffered whole-expert pread per miss (page-cache
+                    # warm), not one 4 KiB fault per page on the mapping
+                    pinned = read_rows(layer_id, role, chunk, ring[:m])
+                    self.staged_pinned_layer[layer_id] += pinned
+                    self.staged_page_layer[layer_id] += m - pinned
+                else:
+                    for c in range(m):
+                        expert = int(chunk[c])
+                        if source is not None:
+                            row = source.warm_row(layer_id, role, expert)
+                            is_pinned = getattr(source, "is_pinned_row", None)
+                            if is_pinned is None or is_pinned(layer_id, role, expert):
+                                self.staged_pinned_layer[layer_id] += 1
+                            else:
+                                self.staged_page_layer[layer_id] += 1
                         else:
-                            self.staged_page_layer[layer_id] += 1
-                    else:
-                        row = per_layer[layer_id][expert]
-                    ring[c].copy_(row)
+                            row = per_layer[layer_id][expert]
+                        ring[c].copy_(row)
                 device[:m].copy_(ring[:m], non_blocking=True)
                 cache.index_copy_(0, evict[start : start + m].long(), device[:m])
                 if start + m < n and self.device.type == "cuda":
@@ -1229,6 +1239,10 @@ class OffloadMoeCache:
             if self._pending_whole_layer:
                 # non-overlap prefill materializes the whole layer at position == expert id
                 # from the pageable mmap views directly (no ring); decode never takes this.
+                # MADV_WILLNEED the bank first so the pageable H2D copy reads ahead instead
+                # of faulting one page at a time (the staged tier is under MADV_RANDOM).
+                if self.expert_source is not None:
+                    self.expert_source.prefetch(layer_id, range(self.num_experts))
                 for per_layer, cache in self.banks:
                     cache[: self.num_experts].copy_(per_layer[layer_id])
                 return

@@ -107,8 +107,10 @@ is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs, 
   (`ft experts repack` + `--expert-source mmap`, see `mmap-expert-tiering.md`) now serves
   sets that exceed the pin budget. Deferred follow-ups from the v1 review:
   - Staged decode copies miss rows one at a time in a Python loop
-    (`offload_cache.py:_copy_missing_staged`) instead of a batched gather; batch it once the
-    source grows a `warm_rows` gather.
+    (`offload_cache.py:_copy_missing_staged`). Reads are now whole-expert buffered `preadv`
+    through `ExpertSource.read_rows_into` (not per-page mmap faults), but the loop still
+    does one H2D + `index_copy_` per ring chunk; batch it once the source grows a
+    `warm_rows` gather.
   - Each staged layer does two device syncs per step (`num_indices.item()` and
     `src_indices.cpu()`), including the all-hit case; read both from one pinned host buffer.
   - An auto-selected mmap source disables decode CUDA graphs with only an info log
@@ -121,8 +123,9 @@ is eager (CUDA graphs off), pass an explicit `--moe-cache-size` if decode OOMs, 
   - `moe/expert_source.py:PinnedExpertSource` and the `ExpertSource.resident`/`expert_bytes`
     members are defined but unused.
   - The cold-path O_DIRECT option and `mincore`-based cold-read counters from the plan are
-    not implemented; ring fill is a page-cache copy. Both are benchmark-gated in the plan,
-    not committed behaviour.
+    not implemented; ring fill is a buffered whole-expert page-cache read
+    (`ExpertSource.read_rows_into`). Both are benchmark-gated in the plan, not committed
+    behaviour. Startup page-cache warming is `--expert-warm` / `FREETOKEN_EXPERT_WARM=1`.
   - Online per-`(layer, expert)` counters are not wired to `--moe-collect-stats`: the server
     path only accumulates `lru_stats` (miss rate), while the histogram needs
     `collect_decode_freq` set programmatically and has no dump endpoint, so

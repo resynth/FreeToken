@@ -685,6 +685,7 @@ class Engine:
                     expert_store=config.expert_store,
                     expert_usage_file=config.expert_usage_file,
                     expert_pin_budget_bytes=pin_budget_bytes,
+                    expert_warm=config.expert_warm,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc

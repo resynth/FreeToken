@@ -62,10 +62,12 @@ Two implementations:
   straight from pageable mmap also works but is ~2x slower; the ring hides that.
 - **The ring must be filled through the page cache, not around it.** O_DIRECT reads bypass
   the page cache, so filling the ring that way would leave the warm tier unused and make
-  `MADV_WILLNEED` prefetch pointless. Default ring fill is a CPU copy from the mmap view into
-  the ring slot. The existing io_uring/O_DIRECT helpers may still serve as a cold-path option
-  for non-resident pages (check residency with `mincore`) if benchmarking shows they beat a
-  faulting copy.
+  `MADV_WILLNEED` prefetch pointless. The ring fill reads each whole expert with one
+  buffered `preadv` (`ExpertSource.read_rows_into`), which is large sequential I/O that
+  populates the page cache; indexing the mmap view instead would fault one 4 KiB page at a
+  time under `MADV_RANDOM` (~20x slower cold). The existing io_uring/O_DIRECT helpers may
+  still serve as a cold-path option for non-resident pages (check residency with `mincore`)
+  if benchmarking shows they beat a faulting copy.
 - Call `madvise(MADV_RANDOM)` on the mapped expert files — access within a layer is random,
   and default readahead would pull adjacent experts into the page cache that no routing
   asked for. (`MADV_WILLNEED` on an explicit range in §4 still triggers readahead for exactly
@@ -96,6 +98,9 @@ Two implementations:
   `_pin_budget_bytes() - ring_bytes`; the staging ring is pinned, so carve it out before
   sizing the top-K subset).
 - `--expert-usage-file <path>` (from `ft experts stats`).
+- `--expert-warm` (`FREETOKEN_EXPERT_WARM=1`): sequentially read the whole store once at
+  startup so the page cache is warm before the first request, instead of faulting experts
+  in on demand. Opt-in because it is a one-off whole-store read (~15 s for 62 GiB here).
 - `--expert-store <dir>` (default: alongside the checkpoint, or a cache dir).
 - `_check_pin_budget` no longer errors for offload; it selects the mmap source instead
   (keeping the error only for `--expert-source pinned`, and for models with no store).
@@ -181,6 +186,7 @@ Verified on a 62 GiB / 16 GiB host with the 512-expert Qwen3.8-Flash-Next IQ4_XS
      --ple-source <fp8-ple-dir-or-repo-id> \
      --expert-source mmap \
      --expert-store <store> \
+     --expert-warm \
      --moe-cache-auto
    ```
    A bare GGUF has no fp8 PLE table, so `--ple-source` is required (an HF repo id such as
@@ -191,6 +197,12 @@ Behaviour to expect:
 - **Staged decode runs eagerly**: the mmap source logs
   `mmap expert source: disabling CUDA graphs (staged H2D is host-driven)`. This is v1's
   correctness-first tradeoff; `ft experts stats` + the pinned warm subset recover speed.
+- **Cold experts are read whole**: the staged ring fill (and the pinned-subset build) issues
+  one buffered `preadv` per expert instead of faulting the mmap one 4 KiB page at a time
+  under `MADV_RANDOM`; the whole-layer prefill path `MADV_WILLNEED`s the bank first.
+- **`--expert-warm`** sequentially reads the store once at startup, so the first token and
+  prefill hit resident pages rather than cold ones. It logs the store size and achieved
+  MiB/s; skip it when boot latency matters more than first-request latency.
 - **`--moe-cache-auto` sizes the GPU slot cache from free VRAM.** On a 16 GiB card with this
   model it resolved `moe_cache_size=2232` and left ~1.5 GiB free. If decode OOMs, pass an
   explicit `--moe-cache-size` (e.g. 1536) instead.
