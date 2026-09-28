@@ -6,6 +6,13 @@ FREETOKEN_ALLOW_CUDA_MISMATCH=1 .venv/bin/ft serve \
   --max-running-requests 1 --max-seq-len-override 4096 --cuda-graph-max-bs 1 \
   --host 127.0.0.1 --port 8000
 
+FREETOKEN_ALLOW_CUDA_MISMATCH=1 .venv/bin/ft serve \
+  --model /media/b/Hyena/gguf/mradermacher/Qwen3.8-Flash-Next-REAM-60Pct-i1-GGUF/Qwen3.8-Flash-Next-REAM-60Pct.i1-IQ4_XS.gguf \
+  --ple-source /home/b/.cache/huggingface/hub/models--Saren--Qwen3.8-Flash-Next-ple-table-fp8/snapshots/50511b0a41aa1d34b8beb7e5d4bb06a0b650dc14 \
+  --dtype bfloat16 --moe-strategy cpu --text-model-only \
+  --max-running-requests 1 --max-seq-len-override 4096 --cuda-graph-max-bs 1 \
+  --host 127.0.0.1 --port 8000
+
 
 source .venv/bin/activate
 ft serve --model /media/b/Hyena/gguf/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf \
