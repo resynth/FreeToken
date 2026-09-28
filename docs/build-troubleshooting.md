@@ -50,9 +50,28 @@ python -c "import freetoken.kernel._cpu_moe, freetoken.kernel._pinned_tensor, fr
 CUDA/Triton kernels are JIT-compiled on first use; the first `ft serve` (or a GPU test) will
 build them, so give it a few minutes.
 
+## `ft: cannot execute: required file not found` (venv moved)
+Console scripts bake their venv's interpreter into the shebang. If the venv was created at
+`<repo>/.venv` and the checkout was later moved or renamed (or a second checkout was made),
+every generated script points at the old path. Symptom:
+
+```
+$ ft serve ...
+bash: /home/b/ai/FreeToken-OG/.venv/bin/ft: cannot execute: required file not found
+$ source .venv/bin/activate
+bash: .venv/bin/activate: No such file or directory
+```
+
+Check with `head -1 $(command -v ft)`; it names the missing interpreter. Fix by restoring the
+path the venv expects (`ln -s <current-venv> <old-venv-path>`) or by recreating the venv at
+the baked-in path. `python -m freetoken.cli <command>` (or any `<venv>/bin/python -m
+freetoken.cli ...`) bypasses the console script entirely, and `ft serve` accepts `--model`
+as an alias of `--model-path`.
+
 ## Expert-bank memory (offload)
 The offload cache pins the whole packed expert set in host RAM at startup; page-locked memory
 cannot be reclaimed or swapped, so a model whose banks exceed available RAM used to OOM the
-host. The engine now budgets 90% of `MemAvailable` (Linux) and fails fast with a clear message
-(`FREETOKEN_PIN_BUDGET_GB` overrides). See [mmap-expert-tiering.md](mmap-expert-tiering.md)
-for the planned hot/warm/cold tiering that removes this ceiling.
+host. The engine budgets 90% of `MemAvailable` (Linux; `FREETOKEN_PIN_BUDGET_GB` overrides)
+and, when the banks exceed it, serves them from a repacked mmap store instead (`ft experts
+repack` + `--expert-source mmap`); without a store it still fails fast with a clear message.
+See [mmap-expert-tiering.md](mmap-expert-tiering.md) for the hot/warm/cold design.

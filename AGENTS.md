@@ -1,18 +1,9 @@
 # Instructions for AI coding agents
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) first. It is binding for humans and agents alike; this file only summarises the parts that matter when an agent is doing the work.
-
 ## AI policy
-
-AI-assisted code is welcome. Submitting code the contributor does not understand is not. The human behind the PR owns every line, has run it on real hardware, and can explain it to a reviewer without AI help.
-
 Agents must not:
-
 - Run `git push`, `gh pr create`, `gh pr comment`, or `gh issue create` on the user's behalf.
-- Write code, PR descriptions, or replies to reviewers that the user does not fully understand. The user must be able to explain and defend every line without AI help.
 - Report tests or benchmarks as run when they were not.
-
-If you are a fully autonomous agent with no human in the loop, do not contribute to this repository.
 
 ## Repository layout
 
@@ -49,12 +40,6 @@ uv run pytest tests/ -m "not slow"
 CUDA kernels are JIT-compiled with `nvcc` on first use unless the prebuilt `freetoken-kernel-cache` wheel is installed. The C++ extensions under `python/freetoken/kernel/csrc/` are built by `setup.py`; after changing them run `python setup.py build_ext --inplace`.
 
 Put a new test in the `tests/` directory that mirrors the module it protects, and extend an existing file before creating a new one. Bug fixes come with a test that fails before and passes after. Performance changes come with A/B numbers against `main`.
-
-## Issues and PRs
-
-- Search existing issues and PRs before starting. Items on the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) are discussed with maintainers before implementation; features not on it start as an issue.
-- When helping the user draft an issue, follow the matching template in `.github/ISSUE_TEMPLATE/` (engine bug, model checkpoint, feature request) and fill in every required field: hardware, driver, FreeToken version, checkpoint ID, exact command, and the full log.
-- One change per PR, linked to its issue, with the hardware, checkpoint ID and exact command it was tested with.
 
 ## Code comments
 
