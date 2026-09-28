@@ -16,15 +16,28 @@ def _repack(args: argparse.Namespace) -> int:
     from freetoken.moe.expert_store import repack_gguf_experts
 
     t0 = time.time()
-    index = repack_gguf_experts(args.model, args.out, drop_ple=args.drop_ple)
+    index = repack_gguf_experts(
+        args.model, args.out, drop_ple=args.drop_ple,
+        usage_file=args.usage_file, warm_file=args.warm_file,
+        hot_prefix=args.hot_prefix, hot_only=args.hot_only,
+    )
     total = index.num_layers * index.num_experts * index.expert_bytes()
+    hot = next((len(loc.hot_ids) for banks in index.banks.values() for loc in banks.values() if loc.hot_ids), 0)
     print(
         f"repacked {index.num_layers} layers x {index.num_experts} experts "
         f"({index.quant_format}) -> {args.out}\n"
         f"  {total / 2**30:.2f} GiB, fingerprint {index.fingerprint}, "
         f"{time.time() - t0:.1f}s"
+        + (f", hot banks {hot}/layer" if hot else "")
     )
     print(f"serve with: ft serve --model {args.model} --expert-source mmap --expert-store {args.out}")
+    if hot:
+        ranked = args.usage_file or args.warm_file
+        hint = "--expert-warm-file" if args.warm_file else "--expert-usage-file"
+        print(
+            f"pin {hot}/layer sequentially with: ft serve ... {hint} {ranked} "
+            "(the pin build reads the hot banks as one sequential pread)"
+        )
     return 0
 
 
@@ -116,6 +129,28 @@ def main(argv: list[str] | None = None, prog: str = "ft experts") -> int:
         p.add_argument("model", help="source .gguf (or a shard of a split GGUF)")
         p.add_argument("--out", required=True, help="output expert-store dir")
         p.add_argument("--drop-ple", action="store_true", help="do not archive the in-GGUF per-layer token embedding")
+        p.add_argument(
+            "--usage-file", default=None,
+            help="ranked per-(layer, expert) counts from `ft experts stats`; with --hot-prefix, "
+                 "also orders the hot banks (hottest first)",
+        )
+        p.add_argument(
+            "--warm-file", default=None,
+            help="retained-expert plan (JSON layer -> [expert ids], e.g. a REAP top-K dump); "
+                 "with --hot-prefix, orders the hot banks by that plan instead",
+        )
+        p.add_argument(
+            "--hot-prefix", type=int, default=0, metavar="K",
+            help="also write per-(layer, role) hot banks holding the top-K experts "
+                 "contiguously (duplicated bytes, K * expert_bytes per layer), so the "
+                 "pinned warm subset builds with one sequential read; needs exactly one "
+                 "of --usage-file / --warm-file",
+        )
+        p.add_argument(
+            "--hot-only", action="store_true",
+            help="patch hot banks into an existing store instead of rewriting the main "
+                 "banks; verifies the store's fingerprint against this checkpoint",
+        )
         return _repack(p.parse_args(rest))
     if sub == "stats":
         p = argparse.ArgumentParser(prog=f"{prog} stats", description="Rank expert usage from a calibration corpus.")

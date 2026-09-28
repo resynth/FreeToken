@@ -22,7 +22,7 @@ import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol, Sequence
 
 import torch
@@ -163,8 +163,10 @@ class MmapExpertSource:
         self.roles = tuple(index.roles)
         self._maps: dict[tuple[int, str], mmap.mmap] = {}
         self._views: dict[tuple[int, str], torch.Tensor] = {}
-        self._fds: dict[tuple[int, str], int] = {}
+        # main-bank fds keyed (layer, role); hot-bank fds keyed (layer, role, "hot")
+        self._fds: dict[tuple, int] = {}
         self._pins: dict[tuple[int, str], _PinnedRows] = {}
+        self._hot_maps: dict[tuple[int, str], dict[int, int]] = {}
         self._closed = False
         self._expert_bytes = index.expert_bytes()
         self.pinned_bytes = 0
@@ -356,6 +358,82 @@ class MmapExpertSource:
         except (OSError, ValueError):
             pass
 
+    def _hot_map(self, layer: int, role: str) -> dict[int, int] | None:
+        """Logical expert id -> hot bank slot; None when the bank has no hot file."""
+        loc = self.index.location(layer, role)
+        if not loc.hot_file or not loc.hot_ids:
+            return None
+        key = (layer, role)
+        mapping = self._hot_maps.get(key)
+        if mapping is None:
+            mapping = {int(e): i for i, e in enumerate(loc.hot_ids)}
+            self._hot_maps[key] = mapping
+        return mapping
+
+    def _hot_fd(self, layer: int, role: str) -> int:
+        """A cached read-only fd for the bank's hot file."""
+        key = (layer, role, "hot")
+        fd = self._fds.get(key)
+        if fd is None:
+            loc = self.index.location(layer, role)
+            path = self.index.resolve_file(self.store_dir, replace(loc, file=loc.hot_file, offset=0))
+            fd = os.open(path, os.O_RDONLY)
+            self._fds[key] = fd
+        return fd
+
+    def _read_hot_prefix(self, layer: int, role: str, nrows: int) -> torch.Tensor:
+        """One sequential buffered pread of the hot bank's first ``nrows`` rows."""
+        loc = self.index.location(layer, role)
+        out = torch.empty((nrows, loc.rows, loc.row_bytes), dtype=torch.uint8)
+        mv = memoryview(out.reshape(-1).numpy())
+        _preadv_full(self._hot_fd(layer, role), mv[: nrows * loc.stride], 0)
+        return out
+
+    def _drop_hot_cache(self, layer: int, role: str) -> None:
+        # the pinned buffer owns the hot data from here on; drop the duplicated clean
+        # pages so they cannot evict the main banks' page cache (this host's warm tier)
+        try:
+            os.posix_fadvise(self._hot_fd(layer, role), 0, 0, os.POSIX_FADV_DONTNEED)
+        except (OSError, AttributeError):
+            pass
+
+    def _fill_pinned_rows(self, layer: int, role: str, ids: list[int], pinned: torch.Tensor) -> None:
+        """Fill a pinned buffer with the planned experts' rows, sequentially when possible.
+
+        The pin build is a one-shot boot read, so it may read the hot bank (one
+        sequential pread of the covering prefix, hottest first) when the plan densely
+        covers it; the plan-is-the-hot-prefix case needs no bounce tensor at all. The
+        ``2 * len(ids)`` bound rejects scattered plans that would read most of the hot
+        bank to serve a few experts. Anything outside the hot bank still comes from the
+        main bank as one buffered whole-expert pread per expert.
+        """
+        slot_of = self._hot_map(layer, role)
+        slots = [slot_of.get(e) for e in ids] if slot_of is not None else None
+        max_slot = max((s for s in slots if s is not None), default=-1) if slots else -1
+        if max_slot >= 0 and max_slot + 1 <= 2 * len(ids):
+            if slots == list(range(len(ids))):
+                # plan == hot prefix, in order: one sequential pread straight into the
+                # pinned buffer, no bounce tensor
+                loc = self.index.location(layer, role)
+                mv = memoryview(pinned.reshape(-1).numpy())
+                _preadv_full(self._hot_fd(layer, role), mv[: loc.stride * len(ids)], 0)
+            else:
+                temp = self._read_hot_prefix(layer, role, max_slot + 1)
+                for k, s in enumerate(slots):
+                    if s is not None:
+                        pinned[k].copy_(temp[s])
+            if any(s is None for s in slots):
+                loc = self.index.location(layer, role)
+                mv = memoryview(pinned.reshape(-1).numpy())
+                fd = self._fd(layer, role)
+                for k, s in enumerate(slots):
+                    if s is None:
+                        _preadv_full(fd, mv[k * loc.stride : (k + 1) * loc.stride], loc.expert_offset(ids[k]))
+            self._drop_hot_cache(layer, role)
+            return
+        # no hot bank, or the plan is too scattered within it: per-expert reads
+        self.read_rows_into(layer, role, ids, pinned)
+
     def _build_pins(self, pin_plan: dict[int, Sequence[int]] | None) -> None:
         if not pin_plan:
             return
@@ -378,8 +456,10 @@ class MmapExpertSource:
                         logger.warning(f"expert store: could not pin warm subset ({exc}); leaving it pageable")
                 if pinned is None:
                     pinned = torch.empty((len(ids), loc.rows, loc.row_bytes), dtype=torch.uint8)
-                # large buffered reads, not per-page faults on the mapping
-                self.read_rows_into(layer, role, ids, pinned)
+                # large sequential reads when the plan covers the hot bank, else one
+                # buffered whole-expert pread per planned expert -- never per-page
+                # faults on the mapping
+                self._fill_pinned_rows(layer, role, ids, pinned)
                 rows = _PinnedRows(tensor=pinned)
                 for slot, expert in enumerate(ids):
                     rows.slot_of[expert] = slot
@@ -441,6 +521,7 @@ class MmapExpertSource:
         self._closed = True
         self._views.clear()
         self._pins.clear()
+        self._hot_maps.clear()
         for mm in self._maps.values():
             try:
                 mm.close()

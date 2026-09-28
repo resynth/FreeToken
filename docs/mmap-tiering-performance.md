@@ -37,7 +37,7 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
 | G | Run `ft experts stats` + `--expert-usage-file` (+ `--expert-pin-budget`) | Med | S to run / S to wire | Low |
 | H | Make staged decode CUDA-graph-capturable | Med-High | L | High |
 | I | Tune `FREETOKEN_EXPERT_PREFETCH`, prefetch same-layer routed experts (implemented) | Med | S | Low |
-| J | Usage-ordered repack (hot experts contiguous per layer) | Med | M | Low |
+| J | Usage-ordered repack (hot banks for the pin build) (implemented) | Med | M | Low |
 | K | `cudaHostRegister` the warm mmap ranges instead of copying to anonymous pinned | Med | L | High |
 | L | Remove the default `MADV_RANDOM` (or make it policy) | Med (moot with A) | S | Low |
 | M | Add a microbenchmark harness so ring/size/usage changes get real A/B numbers (implemented) | Enables all | S-M | None |
@@ -160,6 +160,39 @@ in large chunks / prefetch them) is worth ~20x on cold and is small.
   visible (`engine._finish_mmap_source`). `FREETOKEN_EXPERT_RING_ROWS` stays env-only
   deliberately: the bench measured the default 8 fastest, so a flag would only invite
   unhelpful tuning.
+- **J - implemented (hot banks + `--hot-only` patch); measured ~1.0x on this NVMe.**
+  `ft experts repack` now takes `--hot-prefix K` with exactly one ranking input
+  (`--usage-file` from `ft experts stats`, or `--warm-file`, e.g. the REAP top-K JSON)
+  and writes a per-`(layer, role)` **hot bank** (`layer-000.gate_up.hot.bin`): the top-K
+  experts' bytes contiguously, hottest first, duplicated on disk (K * expert_bytes per
+  layer). The index records `hot_file` + `hot_ids` per bank (additive; old stores and
+  old engines interop both ways). `--hot-only` patches hot banks into an existing store
+  without rewriting the main banks, after verifying the store's fingerprint against
+  this checkpoint - the first place the fingerprint (which the engine still does not
+  check at load, gguf.md "Known limits") is enforced. `MmapExpertSource._build_pins`
+  then fills the pinned warm subset from the hot bank when the plan densely covers it:
+  plan == hot prefix in order is ONE sequential `preadv` straight into the pin buffer
+  (no bounce tensor), a dense-but-permuted plan reads the covering prefix into a
+  bounce tensor and scatters in RAM, plans sparser than half the hot bank fall back to
+  the per-expert path, and out-of-hot experts always come from the main bank. After a
+  hot read the source `POSIX_FADV_DONTNEED`s the hot file: the pin buffer owns the data,
+  and the duplicated pages must not squat the page cache (the F caveat's mechanism).
+  Why hot banks instead of the doc's original permuted-row layout: every consumer of
+  `ExpertSource.all_layer_views` treats host row `e` as logical expert `e`
+  (`_materialize_layer_kernel`'s `src_indices = off` / `slot_for_id[base + e] = e`, the
+  LRU `lru_ensure` resolving `src_indices` as host rows, the CPU executor's pointer
+  tables indexing by routed id, `copy_missing`'s positional whole-layer copy) - a
+  permuted file cannot present a logical-order `[E, ...]` view without a copy, so the
+  permutation lives in duplicated hot banks that only the pin build reads. Serving
+  paths deliberately keep reading the main banks. Measured (`bench_expert_store.py
+  --section pin`, all-real-byte store at the model's 2.64 MiB experts + the real
+  store's 2.54 MiB): cold pin build hot 651 ms vs scattered 642 ms per 384-expert
+  layer (**0.98x**); the real store's cold scattered baseline is 886 ms/layer
+  (~1.1 GiB/s), warm 308 ms (~3.2 GiB/s). On these NVMe devices a scattered sequence
+  of 1.3-2.6 MiB reads at queue depth 1 already runs at the sequential rate, so the
+  layout win is confined to storage where sequential beats random (spinning disks,
+  network stores) or small-request regimes - J is correct, tested infrastructure, not
+  a speedup on this host. Do not build hot banks for this model expecting tok/s.
 
 Local C A/B against the real store (`layer-000`, `gate_up`, cache_size 512, ring rows 8,
 `--legacy`, page-warm, 21 reps). Only the chunked cases move; a single-chunk layer is
@@ -437,6 +470,16 @@ file. Once A exists, prefetch the *current* layer's `src_ids` ranges (they are k
 copy) and consider a larger next-layer depth. Cheap to A/B.
 
 ### J. Usage-ordered repack - Impact Med, Effort M
+_(implemented, see Status, with one redesign forced by the code and one honest
+measurement: physical row permutation would break the per-layer host-bank contract
+``row == logical expert id`` - ``_materialize_layer_kernel`` writes ``src_indices = off``
+and ``slot_for_id[base + e] = e``, the LRU ``lru_ensure`` resolves ``src_indices`` as
+host rows, and the CPU executor's pointer tables index by routed id - so the store keeps
+logical row order and adds per-``(layer, role)`` **hot banks** instead: duplicated
+top-K bytes, contiguous, consumed only by the pin build. Measured ~1.0x on this NVMe -
+at QD1 a scattered sequence of multi-MiB preads already runs at the sequential rate, so
+the win is confined to storage where sequential beats random (spinning rust, network) or
+to small-request regimes.)_
 The store is already expert-contiguous per `(layer, role)`, so a whole-expert read is one
 extent (`moe/expert_store.py:328-360`). If a usage ranking is available, repacking with hot
 experts first (and optionally split into `hot.bin`/`cold.bin` per layer) makes prefetch and
@@ -573,7 +616,9 @@ surfaces:
    store directly with per-routed-expert prefetch. Prefill still streams whole layers._
 6. J, then H, then K as follow-ups (J compounds with the same usage file I now consumes;
    H only pays on staged GPU decode, which `--moe-strategy cpu` avoids entirely; K last,
-   per its own risk notes).
+   per its own risk notes). _J done: hot banks + `--hot-only`, but measured ~1.0x on
+   this NVMe (see Status) - infrastructure for other storage classes, not a win here.
+   Remaining: H (only for staged GPU decode), K._
 
 M (the `benchmarks/bench_expert_store.py` harness) is the measurement gate for all of the
 above; run it before and after any ring/source policy change.
@@ -645,7 +690,7 @@ See `docs/mmap-tiering-performance.md` for the full status and numbers.
   floor is handled by `_cpu_moe.set_mmap_prefetch`, which `MADV_WILLNEED`s each routed
   expert's gate_up/down range before the pool computes it. Prefill still streams whole layers
   into the GPU slot cache, so keep `--expert-warm` (or a small pin); H (graph-capturable staged
-  decode), J (repack ordering) and K (`cudaHostRegister`) remain as follow-ups, and L stays
+  decode) and K (`cudaHostRegister`) remain as follow-ups, and L stays
   moot (A's `pread`/`WILLNEED` paths do not depend on the `MADV_RANDOM` default, and
   `MADV_WILLNEED` ignores the VMA's random policy, so I composes with it).
 - **Same-layer prefetch + the depth flag (I, done; N's flag/warning folded in):** the staged
@@ -653,4 +698,13 @@ See `docs/mmap-tiering-performance.md` for the full status and numbers.
   next-layer depth is `--expert-prefetch N` (flag > `FREETOKEN_EXPERT_PREFETCH` > 4, and 0
   disables all prefetch), and the mmap graph-disable is now a warning, not an info. Measured a
   wash on this NVMe (see Status); the flag doubles as the A/B kill switch.
+- **Hot banks for the pin build (J, done; measured ~1.0x here):** `ft experts repack
+  --hot-prefix K --usage-file|--warm-file [--hot-only]` writes contiguous duplicated top-K
+  banks per (layer, role); the index records the ranking, `--hot-only` patches an existing
+  store after a fingerprint check, and `_build_pins` fills the warm subset with one
+  sequential pread when the plan densely covers the hot bank (dropping the duplicated
+  pages afterwards). The row-permutation design was dropped because the per-layer
+  host-bank contract (`row == expert id`) is load-bearing for the whole-layer prefill
+  copy, the LRU remap and the CPU executor; see Status for the measured numbers and the
+  honest verdict - keep it off this model's build recipes.
 

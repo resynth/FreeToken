@@ -17,11 +17,18 @@ Two sections, both against a repacked expert store (`ft experts repack`):
    that C rewrote; use it to size `FREETOKEN_EXPERT_RING_ROWS` instead of A/B-ing the
    server, which is too slow and noisy to isolate anything before A/B land.
 
+3. **Pin build** -- `MmapExpertSource._build_pins` over a hot-ranked plan: the hot
+   bank's one sequential pread vs the per-expert scattered fallback (the same store
+   with the index's hot entries stripped), cold/warm. Without hot banks, only the
+   scattered baseline runs.
+
 A final projection turns the measured whole-expert throughput into per-token and
 per-1000-token-prefill wall time.
 
 A bare GGUF has no store; `--store` is required for real numbers. Without it the script
-synthesizes a tiny local store so the plumbing can be smoke-tested anywhere.
+synthesizes a tiny local store so the plumbing can be smoke-tested anywhere
+(`--section pin` synthesizes a real-geometry, all-real-bytes store with hot banks
+instead, so its cold numbers are honest).
 
 Run:
   PYTHONPATH=python python benchmarks/bench_expert_store.py --store /path/to/store
@@ -38,6 +45,7 @@ import random
 import statistics
 import tempfile
 import time
+from dataclasses import replace
 
 import torch
 
@@ -54,7 +62,7 @@ MiB = 1 << 20
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--store", default=None, help="expert store dir; omit to synthesize one")
-    p.add_argument("--section", choices=["all", "read", "staged"], default="all")
+    p.add_argument("--section", choices=["all", "read", "staged", "pin"], default="all")
     p.add_argument("--gpu", default=None, help="GPU UUID or nvidia-smi index (staged section)")
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--role", default="gate_up")
@@ -78,6 +86,9 @@ def parse_args() -> argparse.Namespace:
                    help="staged section: also time the copy with the same-layer miss "
                         "WILLNEED disabled, as an A/B column (the default column has "
                         "it on)")
+    p.add_argument("--pin", type=int, default=0, metavar="K",
+                   help="pin section: experts per layer to pin (default: all hot ids, "
+                        "or 64 random ones when the store has no hot banks)")
     return p.parse_args()
 
 
@@ -85,28 +96,52 @@ def parse_args() -> argparse.Namespace:
 
 
 def make_synthetic_store(root: str, *, layers: int = 2, experts: int = 512,
-                         hidden: int = 256, inter: int = 64) -> None:
-    """A tiny valid store with the same file/index layout as `ft experts repack`."""
+                         hidden: int = 256, inter: int = 64, hot: int = 0,
+                         real_cap: int = 0) -> None:
+    """A tiny valid store with the same file/index layout as `ft experts repack`.
+
+    ``hot`` writes per-(layer, role) hot banks covering expert ids ``0..hot-1`` (the
+    common prefix case). ``real_cap`` bounds the actually-written random bytes per file
+    (0 writes everything real); the remainder is a sparse truncate. Cold reads of
+    sparse regions do no disk I/O, so an honest cold A/B needs real bytes.
+    """
     os.makedirs(root, exist_ok=True)
     gu_rows, gu_row_bytes = 2 * inter, (hidden // 32) * 18
     dn_rows, dn_row_bytes = hidden, (inter // 32) * 18
-    rng = random.Random(0)
+
+    def write(path: str, size: int) -> None:
+        with open(path, "wb") as f:
+            left = size if real_cap <= 0 else min(size, real_cap)
+            while left > 0:
+                chunk = os.urandom(min(left, 8 << 20))
+                f.write(chunk)
+                left -= len(chunk)
+            f.truncate(size)
+
     index_layers = []
     for layer in range(layers):
+        names, sizes, locs = [], [], []
         gu = os.path.join(root, f"layer-{layer:03d}.gate_up.bin")
         dn = os.path.join(root, f"layer-{layer:03d}.down.bin")
-        with open(gu, "wb") as f:
-            f.write(bytes(rng.getrandbits(8) for _ in range(min(experts * gu_rows * gu_row_bytes, 1 << 22))))
-            f.truncate(experts * gu_rows * gu_row_bytes)
-        with open(dn, "wb") as f:
-            f.write(bytes(rng.getrandbits(8) for _ in range(min(experts * dn_rows * dn_row_bytes, 1 << 22))))
-            f.truncate(experts * dn_rows * dn_row_bytes)
-        index_layers.append({"layer": layer, "banks": {
+        write(gu, experts * gu_rows * gu_row_bytes)
+        write(dn, experts * dn_rows * dn_row_bytes)
+        banks = {
             "gate_up": {"file": os.path.basename(gu), "offset": 0,
                         "stride": gu_rows * gu_row_bytes, "rows": gu_rows, "row_bytes": gu_row_bytes},
             "down": {"file": os.path.basename(dn), "offset": 0,
                      "stride": dn_rows * dn_row_bytes, "rows": dn_rows, "row_bytes": dn_row_bytes},
-        }})
+        }
+        if hot:
+            hot_ids = list(range(hot))
+            for role, name, rows, row_bytes in (
+                ("gate_up", f"layer-{layer:03d}.gate_up.hot.bin", gu_rows, gu_row_bytes),
+                ("down", f"layer-{layer:03d}.down.hot.bin", dn_rows, dn_row_bytes),
+            ):
+                path = os.path.join(root, name)
+                write(path, hot * rows * row_bytes)
+                banks[role]["hot_file"] = name
+                banks[role]["hot_ids"] = hot_ids
+        index_layers.append({"layer": layer, "banks": banks})
     doc = {
         "format": STORE_FORMAT, "version": STORE_VERSION, "align": 4096,
         "quant_format": "iq4_nl", "num_layers": layers, "num_experts": experts,
@@ -422,6 +457,91 @@ def bench_staged(store_dir: str, args: argparse.Namespace, device: torch.device)
             torch.cuda.empty_cache()
 
 
+def bench_pin(store_dir: str, args: argparse.Namespace) -> None:
+    """Pin-build A/B: the hot bank's one sequential pread vs per-expert scattered preads.
+
+    With hot banks in the store, the same store is opened twice with the same plan -
+    once as-is (sequential hot path) and once with the hot entries stripped from the
+    index (the per-expert fallback) - so the A/B shares one directory and one cold/warm
+    regime. Without hot banks, only the scattered baseline is measured (a random plan),
+    which is the pre-J cold pin build on a real store.
+    """
+    index = ExpertStoreIndex.load(store_dir)
+    hot_ids = list(index.location(args.layer, "gate_up").hot_ids)
+
+    # isolate the read pattern: both variants build into plain (unpinned) buffers, since
+    # the cudaHostRegister cost of a real pin is variant-independent
+    real_is_available = torch.cuda.is_available
+    torch.cuda.is_available = lambda: False
+    try:
+        _bench_pin_inner(store_dir, args, index, hot_ids)
+    finally:
+        torch.cuda.is_available = real_is_available
+
+
+def _bench_pin_inner(store_dir: str, args: argparse.Namespace, index, hot_ids: list[int]) -> None:
+    def layer_paths(idx) -> list[str]:
+        paths = [idx.resolve_file(store_dir, idx.location(args.layer, role)) for role in idx.roles]
+        for role in idx.roles:
+            loc = idx.location(args.layer, role)
+            if loc.hot_file:
+                paths.append(idx.resolve_file(store_dir, replace(loc, file=loc.hot_file, offset=0)))
+        return paths
+
+    def drop() -> None:
+        for path in layer_paths(index):
+            drop_page_cache(path, args.aggressive_drop)
+
+    def build_time(idx, plan: dict[int, list[int]], cold: bool) -> float:
+        def fn() -> None:
+            source = MmapExpertSource(store_dir, idx, pin_plan=plan)
+            source.close()
+        return _time(fn, args.repeat, before=(drop if cold else None))
+
+    def fmt(ms: float) -> str:
+        return f"{ms:>10.1f}" if ms == ms else f"{'-':>10}"
+
+    if not hot_ids:
+        n = min(args.pin or 64, index.num_experts)
+        ids = random.Random(7).sample(range(index.num_experts), n)
+        moved = n * index.expert_bytes() / MiB
+        warm_ms = build_time(index, {args.layer: ids}, False) * 1e3
+        cold_ms = build_time(index, {args.layer: ids}, True) * 1e3 if args.cold else float("nan")
+        print(f"\npin build: store has no hot banks; scattered baseline only "
+              f"(random {n}-expert plan, layer {args.layer}, cold={args.cold})")
+        print(f"  cold {fmt(cold_ms)} ms   warm {fmt(warm_ms)} ms   "
+              f"warm {moved / (warm_ms / 1e3):>8.1f} MiB/s   "
+              f"(hot banks need `ft experts repack ... --hot-prefix K`)")
+        return
+
+    k = min(args.pin or len(hot_ids), len(hot_ids))
+    plan = {args.layer: hot_ids[:k]}
+    moved = k * index.expert_bytes() / MiB
+    stripped = replace(index, banks={
+        layer: {role: replace(loc, hot_file=None, hot_ids=()) for role, loc in banks.items()}
+        for layer, banks in index.banks.items()
+    })
+    print(f"\npin build: {k} experts/layer ({index.expert_bytes() / MiB:.2f} MiB/expert), "
+          f"plan = hot prefix (cold={args.cold})")
+    print(f"{'variant':<12} {'cold ms':>10} {'cold MiB/s':>10} {'warm ms':>10} {'warm MiB/s':>10}")
+    print("-" * 58)
+    times: dict[str, tuple[float, float]] = {}
+    for name, idx in (("hot bank", index), ("scattered", stripped)):
+        cold_ms = build_time(idx, plan, True) * 1e3 if args.cold else float("nan")
+        warm_ms = build_time(idx, plan, False) * 1e3
+        times[name] = (cold_ms, warm_ms)
+        cold_bw = moved / (cold_ms / 1e3) if cold_ms == cold_ms else float("nan")
+        print(f"{name:<12} {fmt(cold_ms)} {fmt(cold_bw)} {fmt(warm_ms)} {fmt(moved / (warm_ms / 1e3))}")
+    hot_cold, hot_warm = times["hot bank"]
+    off_cold, off_warm = times["scattered"]
+    if off_cold == off_cold:
+        print(f"{'speedup':<12} {off_cold / hot_cold:>9.2f}x")
+    else:
+        print(f"{'speedup':<12} {off_warm / hot_warm:>9.2f}x (warm)")
+    print("(the hot variant drops its own pages after each build by design, so its warm")
+    print(" column re-reads cold; compare cold-vs-cold)")
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -431,7 +551,15 @@ def main() -> None:
     store_dir = args.store
     if store_dir is None:
         tmp = tempfile.mkdtemp(prefix="ft-expert-store-bench-")
-        make_synthetic_store(tmp)
+        if args.section == "pin":
+            # real-geometry, all-real-bytes store with hot banks, so the pin A/B's
+            # cold numbers mean something (sparse holes would do no disk I/O)
+            make_synthetic_store(
+                tmp, layers=2, experts=512, hidden=2560, inter=640,
+                hot=args.pin or 384,
+            )
+        else:
+            make_synthetic_store(tmp)
         store_dir = tmp
         print(f"no --store: synthesized {store_dir}")
 
@@ -454,6 +582,9 @@ def main() -> None:
             assign_gpu(single_gpu_arg(args.gpu))
             device = bind_assigned_gpu()
         bench_staged(store_dir, args, device)
+
+    if args.section in ("all", "pin"):
+        bench_pin(store_dir, args)
 
     if tmp is not None:
         import shutil

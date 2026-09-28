@@ -230,6 +230,14 @@ Verified on a 62 GiB / 16 GiB host with the 512-expert Qwen3.8-Flash-Next IQ4_XS
    ```
    ft experts repack <model.gguf> --out <store> --drop-ple
    ```
+   Optional (J): `--hot-prefix K` with exactly one ranking input (`--usage-file` from
+   `ft experts stats`, or `--warm-file`, e.g. a REAP top-K dump) also writes per-
+   `(layer, role)` hot banks - the top-K experts' bytes contiguously, duplicated - so
+   the pinned warm subset builds with one sequential pread per bank when the plan
+   covers it; `--hot-only` patches hot banks into an existing store (fingerprint-
+   verified) instead of rewriting the main banks. Measured ~1.0x on this host's NVMe
+   (sequential ~= scattered at QD1 for multi-MiB reads), so skip it here unless the
+   store lives on storage where sequential beats random.
    `--drop-ple` skips the checkpoint's own `per_layer_token_embd.weight`. The qwen4exp GGUFs
    carry one (~28.8 GiB) that the engine never reads when `--ple-source` is set, so archiving
    it only wastes disk. If you already built a store without it, delete `<store>/ple.bin` and

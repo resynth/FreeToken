@@ -17,6 +17,16 @@ role ``r`` in layer ``l`` is the byte range ``[offset(l, r) + e * stride(r), +st
 verbatim (no dequant), preallocates each output file (``posix_fallocate``) and writes
 sequentially so the store lands in contiguous extents.
 
+``repack_gguf_experts(..., hot_prefix=K, usage_file=...)`` additionally writes a per-
+``(layer, role)`` *hot bank* (``layer-000.gate_up.hot.bin``): the top-K experts by usage
+rank, contiguously, duplicating those bytes. The hot bank exists only so the pinned warm
+subset builds with one sequential read; every serving path keeps reading the main bank,
+because duplicated pages would only evict the page cache the main banks need. The row
+order of the main banks is *not* permuted: the per-layer host bank contract
+(``ExpertSource.all_layer_views`` -> ``row == logical expert id``) is load-bearing for the
+whole-layer prefill copy, the LRU ``src_indices`` remap and the CPU executor's pointer
+tables.
+
 The store is read-only at serving time; see
 :class:`~freetoken.moe.expert_source.MmapExpertSource`.
 """
@@ -79,6 +89,12 @@ class BankLocation:
     stride: int  # expert_bytes
     rows: int
     row_bytes: int
+    # J: an optional hot bank holding a per-layer usage-ranked subset of the same
+    # experts contiguously (hottest first). It exists only so the pinned warm subset
+    # can be built with one sequential read; every serving path keeps reading the
+    # main bank (duplicated pages would only evict the page cache the main banks need).
+    hot_file: str | None = None
+    hot_ids: tuple[int, ...] = ()  # logical expert ids in hot-bank physical order
 
     @property
     def expert_bytes(self) -> int:
@@ -129,6 +145,8 @@ class ExpertStoreIndex:
                     stride=int(loc["stride"]),
                     rows=int(loc["rows"]),
                     row_bytes=int(loc["row_bytes"]),
+                    hot_file=loc.get("hot_file"),
+                    hot_ids=tuple(int(e) for e in loc.get("hot_ids", ())),
                 )
                 for role, loc in entry["banks"].items()
             }
@@ -222,14 +240,106 @@ def _write_bank(path: str, size: int, write) -> None:
     os.replace(tmp, path)
 
 
+def _hot_ranking(
+    *, usage_file: str | None, warm_file: str | None, hot_prefix: int,
+    num_layers: int, num_experts: int,
+) -> list[list[int]] | None:
+    """Per-layer expert ids to place in the hot banks (hottest first); None = no hot banks.
+
+    Exactly one ranking input is accepted: ``usage_file`` (a ranked ``ft experts stats``
+    dump) or ``warm_file`` (an unranked retained-expert plan such as a REAP top-K dump --
+    contiguity is what the pin build wants, not the order within the set). A layer the
+    plan omits gets an empty list, i.e. no hot bank.
+    """
+    from freetoken.moe.usage import load_usage, load_warm_plan
+
+    if hot_prefix <= 0:
+        if usage_file or warm_file:
+            raise ValueError("--usage-file/--warm-file rank the hot banks; pass --hot-prefix too")
+        return None
+    if (usage_file is None) == (warm_file is None):
+        raise ValueError(
+            "--hot-prefix needs exactly one ranking input: --usage-file (ranked counts) "
+            "or --warm-file (a retained-expert plan)"
+        )
+    k = min(hot_prefix, num_experts)
+    ranking: list[list[int]] = []
+    if usage_file is not None:
+        usage = load_usage(usage_file)
+        if usage.num_layers != num_layers or usage.num_experts != num_experts:
+            raise ValueError(
+                f"usage file {usage_file!r} holds {usage.num_layers} x {usage.num_experts} "
+                f"counts but the model has {num_layers} x {num_experts} experts"
+            )
+        return [usage.rank(layer)[:k] for layer in range(num_layers)]
+    plan = load_warm_plan(warm_file)
+    out_of_range = [layer for layer in plan if layer >= num_layers]
+    if out_of_range:
+        raise ValueError(
+            f"warm plan {warm_file!r} names layer {max(out_of_range)} but the model has "
+            f"{num_layers} MoE layers"
+        )
+    for layer in range(num_layers):
+        ids: list[int] = []
+        for e in plan.get(layer, []):
+            if not 0 <= int(e) < num_experts:
+                raise ValueError(
+                    f"warm plan {warm_file!r}: expert {e} is out of range for layer {layer}"
+                )
+            if int(e) not in ids:
+                ids.append(int(e))
+        ranking.append(ids[:k])
+    return ranking
+
+
+def _verify_patchable(
+    existing: ExpertStoreIndex, out_dir: str, *, num_layers: int, num_experts: int,
+    hidden: int, inter: int, quant_format: str, fingerprint: str,
+) -> None:
+    """--hot-only safety: the existing store must be this checkpoint's own repack."""
+    if not existing.fingerprint:
+        raise ValueError(
+            f"--hot-only: {out_dir} carries no fingerprint; run a full `ft experts repack` first"
+        )
+    problems = []
+    if existing.fingerprint != fingerprint:
+        problems.append(f"fingerprint {existing.fingerprint} != this checkpoint's {fingerprint}")
+    if (existing.num_layers, existing.num_experts, existing.hidden_size,
+            existing.intermediate_size) != (num_layers, num_experts, hidden, inter):
+        problems.append(
+            f"geometry {existing.num_layers} x {existing.num_experts} of "
+            f"{existing.hidden_size}/{existing.intermediate_size} != "
+            f"{num_layers} x {num_experts} of {hidden}/{inter}"
+        )
+    if existing.quant_format != quant_format:
+        problems.append(f"quant_format {existing.quant_format!r} != {quant_format!r}")
+    if problems:
+        raise ValueError(
+            f"--hot-only: {out_dir} was not built from this checkpoint "
+            f"({'; '.join(problems)}); run a full repack"
+        )
+
+
 def repack_gguf_experts(
     model_path: str,
     out_dir: str,
     *,
     drop_ple: bool = False,
+    usage_file: str | None = None,
+    warm_file: str | None = None,
+    hot_prefix: int = 0,
+    hot_only: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> ExpertStoreIndex:
     """Repack a GGUF's routed experts into ``out_dir`` verbatim (no dequant).
+
+    With ``hot_prefix > 0`` and exactly one ranking input (``usage_file``: ranked
+    counts; ``warm_file``: a retained-expert plan), additionally writes a per-
+    ``(layer, role)`` *hot bank*: the top experts contiguously, hottest first,
+    duplicating those bytes. The hot bank exists only so the pinned warm subset
+    builds with one sequential read (`MmapExpertSource._build_pins`); serving
+    paths keep reading the main banks. ``hot_only`` patches hot banks into an
+    existing store after verifying it was built from this checkpoint.
 
     Returns the written index. Raises for a checkpoint whose expert tensors are missing,
     mixed, or non-contiguous across layers.
@@ -323,45 +433,109 @@ def repack_gguf_experts(
                     f"(layer {layer})"
                 )
 
+    fingerprint = _fingerprint(table)
+    hot_ids_per_layer = _hot_ranking(
+        usage_file=usage_file, warm_file=warm_file, hot_prefix=hot_prefix,
+        num_layers=num_layers, num_experts=num_experts,
+    )
+    existing = None
+    if hot_only:
+        if hot_ids_per_layer is None:
+            raise ValueError("--hot-only needs --hot-prefix with --usage-file or --warm-file")
+        if drop_ple:
+            raise ValueError("--hot-only writes hot banks only; run a full repack to change PLE archiving")
+        existing = ExpertStoreIndex.load(out_dir)
+        _verify_patchable(
+            existing, out_dir, num_layers=num_layers, num_experts=num_experts,
+            hidden=hidden, inter=inter, quant_format=quant_format, fingerprint=fingerprint,
+        )
+
     index_banks: dict[int, dict[str, dict]] = {}
     written: set[str] = set()
+    if existing is not None:
+        # keep the existing main banks and PLE entry verbatim; only the hot banks change
+        for layer in range(num_layers):
+            index_banks[layer] = {
+                role: {
+                    "file": loc.file, "offset": loc.offset, "stride": loc.stride,
+                    "rows": loc.rows, "row_bytes": loc.row_bytes,
+                }
+                for role, loc in existing.banks[layer].items()
+            }
+            written.update(loc.file for loc in existing.banks[layer].values())
+        if existing.ple and existing.ple.get("file"):
+            written.add(existing.ple["file"])
+
     for layer in range(num_layers):
         slot = layers[layer]
-        gu_file = f"layer-{layer:03d}.gate_up.bin"
-        gu_size = num_experts * 2 * inter * h_bytes
+        if existing is None:
+            gu_file = f"layer-{layer:03d}.gate_up.bin"
+            gu_size = num_experts * 2 * inter * h_bytes
 
-        def _write_gate_up(fd: int, slot=slot) -> None:
-            if "gate_up" in slot:
-                _write_bytes(fd, slot["gate_up"]._raw)
-            else:
-                gate = slot["gate"]._raw.reshape(num_experts, inter, h_bytes)
-                up = slot["up"]._raw.reshape(num_experts, inter, h_bytes)
-                for e in range(num_experts):
-                    _write_bytes(fd, gate[e])
-                    _write_bytes(fd, up[e])
+            def _write_gate_up(fd: int, slot=slot) -> None:
+                if "gate_up" in slot:
+                    _write_bytes(fd, slot["gate_up"]._raw)
+                else:
+                    gate = slot["gate"]._raw.reshape(num_experts, inter, h_bytes)
+                    up = slot["up"]._raw.reshape(num_experts, inter, h_bytes)
+                    for e in range(num_experts):
+                        _write_bytes(fd, gate[e])
+                        _write_bytes(fd, up[e])
 
-        _write_bank(os.path.join(out_dir, gu_file), gu_size, _write_gate_up)
-        written.add(gu_file)
+            _write_bank(os.path.join(out_dir, gu_file), gu_size, _write_gate_up)
+            written.add(gu_file)
 
-        dn_file = f"layer-{layer:03d}.down.bin"
-        dn_size = num_experts * hidden * i_bytes
-        _write_bank(os.path.join(out_dir, dn_file), dn_size, lambda fd: _write_bytes(fd, slot["down"]._raw))
-        written.add(dn_file)
+            dn_file = f"layer-{layer:03d}.down.bin"
+            dn_size = num_experts * hidden * i_bytes
+            _write_bank(os.path.join(out_dir, dn_file), dn_size, lambda fd: _write_bytes(fd, slot["down"]._raw))
+            written.add(dn_file)
 
-        index_banks[layer] = {
-            "gate_up": {
-                "file": gu_file, "offset": 0, "stride": 2 * inter * h_bytes,
-                "rows": 2 * inter, "row_bytes": h_bytes,
-            },
-            "down": {
-                "file": dn_file, "offset": 0, "stride": hidden * i_bytes,
-                "rows": hidden, "row_bytes": i_bytes,
-            },
-        }
+            index_banks[layer] = {
+                "gate_up": {
+                    "file": gu_file, "offset": 0, "stride": 2 * inter * h_bytes,
+                    "rows": 2 * inter, "row_bytes": h_bytes,
+                },
+                "down": {
+                    "file": dn_file, "offset": 0, "stride": hidden * i_bytes,
+                    "rows": hidden, "row_bytes": i_bytes,
+                },
+            }
+
+        if hot_ids_per_layer is not None and (ids := hot_ids_per_layer[layer]):
+            # the hot banks duplicate the top experts' bytes, contiguously, so the pin
+            # build reads them sequentially instead of one scattered pread per expert
+            gu_hot = f"layer-{layer:03d}.gate_up.hot.bin"
+            dn_hot = f"layer-{layer:03d}.down.hot.bin"
+
+            def _write_hot_gate_up(fd: int, slot=slot, ids=ids) -> None:
+                if "gate_up" in slot:
+                    rows = slot["gate_up"]._raw.reshape(num_experts, 2 * inter, h_bytes)
+                    for e in ids:
+                        _write_bytes(fd, rows[e])
+                else:
+                    gate = slot["gate"]._raw.reshape(num_experts, inter, h_bytes)
+                    up = slot["up"]._raw.reshape(num_experts, inter, h_bytes)
+                    for e in ids:
+                        _write_bytes(fd, gate[e])
+                        _write_bytes(fd, up[e])
+
+            def _write_hot_down(fd: int, slot=slot, ids=ids) -> None:
+                rows = slot["down"]._raw.reshape(num_experts, hidden, i_bytes)
+                for e in ids:
+                    _write_bytes(fd, rows[e])
+
+            _write_bank(os.path.join(out_dir, gu_hot), len(ids) * 2 * inter * h_bytes, _write_hot_gate_up)
+            _write_bank(os.path.join(out_dir, dn_hot), len(ids) * hidden * i_bytes, _write_hot_down)
+            written.update((gu_hot, dn_hot))
+            for role, hot in (("gate_up", gu_hot), ("down", dn_hot)):
+                index_banks[layer][role]["hot_file"] = hot
+                index_banks[layer][role]["hot_ids"] = list(ids)
         say(f"expert store: layer {layer + 1}/{num_layers}")
 
     ple_entry = None
-    if ple_tensor is not None:
+    if existing is not None:
+        ple_entry = existing.ple
+    elif ple_tensor is not None:
         if drop_ple:
             say("expert store: dropping per-layer token embedding (--drop-ple)")
         else:
@@ -386,7 +560,7 @@ def repack_gguf_experts(
         "roles": ["gate_up", "down"],
         "gate_up_type": int(gate_up_type),
         "down_type": int(down_type),
-        "fingerprint": _fingerprint(table),
+        "fingerprint": fingerprint,
         "source_path": os.path.abspath(model_path),
         "layers": [{"layer": layer, "banks": index_banks[layer]} for layer in range(num_layers)],
     }
@@ -410,6 +584,8 @@ def repack_gguf_experts(
             pass
     say(
         f"expert store: wrote {out_dir} "
-        f"({num_layers} layers x {num_experts} experts, {quant_format})"
+        f"({num_layers} layers x {num_experts} experts, {quant_format}"
+        + (f", hot banks {len(next(iter(hot_ids_per_layer or [])))}/layer" if hot_ids_per_layer else "")
+        + ")"
     )
     return ExpertStoreIndex.load(out_dir)

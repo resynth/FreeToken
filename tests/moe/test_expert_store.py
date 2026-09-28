@@ -792,3 +792,217 @@ def test_warm_cache_reads_every_bank(monkeypatch, tmp_path):
     source.close()
     warmed.close()
 
+
+# ---- J: usage-ranked hot banks for a sequential pin build ----
+
+
+def _usage_file(tmp_path, counts) -> str:
+    from freetoken.moe.usage import UsageData
+
+    path = tmp_path / "usage.json"
+    UsageData(counts=counts).save(str(path))
+    return str(path)
+
+
+def test_repack_writes_hot_banks_in_usage_order(monkeypatch, tmp_path):
+    from freetoken.moe.expert_store import ExpertStoreIndex
+
+    E, H, I, L = 4, 64, 32, 2
+    tensors = _fused_tensors(L, E, H, I)
+    # layer 0 rank: 1, 2, 0, 3; layer 1 rank: 3, 0, 1, 2
+    counts = [[10, 40, 30, 0], [5, 0, 0, 9]]
+    usage = _usage_file(tmp_path, counts)
+    index = _repack(monkeypatch, tensors, tmp_path, usage_file=usage, hot_prefix=2)
+    index = ExpertStoreIndex.load(str(tmp_path))
+    assert index.location(0, "gate_up").hot_ids == (1, 2)
+    assert index.location(0, "down").hot_ids == (1, 2)
+    assert index.location(1, "gate_up").hot_ids == (3, 0)
+    assert index.location(0, "gate_up").hot_file == "layer-000.gate_up.hot.bin"
+
+    # the hot bank holds those experts' rows contiguously, in rank order
+    for layer, hot in ((0, (1, 2)), (1, (3, 0))):
+        for role, suffix in (("gate_up", "ffn_gate_up_exps.weight"), ("down", "ffn_down_exps.weight")):
+            t = next(t for t in tensors if t.name == f"blk.{layer}.{suffix}")
+            loc = index.location(layer, role)
+            rows = t._raw.reshape(E, loc.rows, loc.row_bytes)
+            with open(tmp_path / loc.hot_file, "rb") as f:
+                got = f.read()
+            assert got == rows[list(hot)].tobytes()
+            assert loc.stride * len(hot) == len(got)
+
+
+def test_repack_hot_banks_accept_a_warm_plan(monkeypatch, tmp_path):
+    import json
+
+    from freetoken.moe.expert_store import ExpertStoreIndex
+
+    E, H, I, L = 4, 64, 32, 2
+    _repack(monkeypatch, _fused_tensors(L, E, H, I), tmp_path)
+    # a fresh dir: full repack from a warm plan, with a missing layer and a duplicate id
+    warm = tmp_path / "warm.json"
+    warm.write_text(json.dumps({"0": [3, 1, 3], "1": [2]}))
+    out = tmp_path / "hot-store"
+    _repack(monkeypatch, _fused_tensors(L, E, H, I), out, warm_file=str(warm), hot_prefix=8)
+    index = ExpertStoreIndex.load(str(out))
+    assert index.location(0, "gate_up").hot_ids == (3, 1)
+    assert index.location(1, "gate_up").hot_ids == (2,)
+    # a plan entry that omits a layer leaves that layer with no hot bank at all
+    out2 = tmp_path / "hot-store2"
+    warm2 = tmp_path / "warm2.json"
+    warm2.write_text(json.dumps({"0": [0]}))
+    _repack(monkeypatch, _fused_tensors(L, E, H, I), out2, warm_file=str(warm2), hot_prefix=8)
+    index2 = ExpertStoreIndex.load(str(out2))
+    assert index2.location(0, "down").hot_ids == (0,)
+    assert index2.location(1, "down").hot_file is None
+    assert not (out2 / "layer-001.gate_up.hot.bin").exists()
+
+
+def test_hot_only_patches_hot_banks_and_verifies_the_source(monkeypatch, tmp_path):
+    from freetoken.moe.expert_store import ExpertStoreIndex
+
+    E, H, I, L = 4, 64, 32, 2
+    counts = [[10, 40, 30, 0], [5, 0, 0, 9]]
+    _repack(monkeypatch, _fused_tensors(L, E, H, I), tmp_path)
+    main = {p.name: p.read_bytes() for p in tmp_path.glob("layer-*.bin")}
+    usage = _usage_file(tmp_path, counts)
+    _repack(monkeypatch, _fused_tensors(L, E, H, I), tmp_path, usage_file=usage, hot_prefix=2, hot_only=True)
+    index = ExpertStoreIndex.load(str(tmp_path))
+    assert index.location(0, "gate_up").hot_ids == (1, 2)
+    # main banks untouched byte-for-byte
+    assert {p.name: p.read_bytes() for p in tmp_path.glob("layer-*.bin") if "hot" not in p.name} == main
+
+    # a store built from a different checkpoint refuses the patch
+    bad = tmp_path / "bad"
+    _repack(monkeypatch, _fused_tensors(L, E, H, I), bad)
+    doc = json.loads((bad / "index.json").read_text())
+    doc["fingerprint"] = "deadbeefdeadbeef"
+    (bad / "index.json").write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="fingerprint"):
+        _repack(
+            monkeypatch, _fused_tensors(L, E, H, I), bad,
+            usage_file=_usage_file(bad, counts), hot_prefix=2, hot_only=True,
+        )
+    # a full repack with hot banks rewrites them cleanly
+    _repack(monkeypatch, _fused_tensors(L, E, H, I), bad, usage_file=_usage_file(bad, counts), hot_prefix=1)
+    assert ExpertStoreIndex.load(str(bad)).location(0, "gate_up").hot_ids == (1,)
+
+
+def test_pin_build_reads_the_hot_prefix_sequentially(monkeypatch, tmp_path):
+    from freetoken.moe.expert_source import MmapExpertSource
+
+    E, H, I = 4, 64, 32
+    tensors = _fused_tensors(1, E, H, I)
+    counts = [[10, 40, 30, 0]]
+    usage = _usage_file(tmp_path, counts)
+    index = _repack(monkeypatch, tensors, tmp_path, usage_file=usage, hot_prefix=3)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    calls = []
+    real = MmapExpertSource._read_hot_prefix
+
+    def spy(self, layer, role, nrows):
+        calls.append((layer, role, nrows))
+        return real(self, layer, role, nrows)
+
+    monkeypatch.setattr(MmapExpertSource, "_read_hot_prefix", spy)
+
+    # the plan is exactly the hot bank's prefix in order: one sequential pread
+    # straight into the pinned buffer, no bounce tensor
+    source = MmapExpertSource.open(str(tmp_path), pin_plan={0: [1, 2, 0]})
+    assert calls == []
+    for role in ("gate_up", "down"):
+        for expert in (0, 1, 2):
+            assert source.is_pinned_row(0, role, expert)
+            assert torch.equal(source.warm_row(0, role, expert), source._view(0, role)[expert])
+    assert not source.is_pinned_row(0, "gate_up", 3)
+    source.close()
+
+
+def test_pin_build_scatters_through_a_bounce_tensor(monkeypatch, tmp_path):
+    """A dense-but-permuted plan uses the sequential hot read + RAM scatter."""
+    from freetoken.moe.expert_source import MmapExpertSource
+
+    E, H, I = 4, 64, 32
+    tensors = _fused_tensors(1, E, H, I)
+    counts = [[10, 40, 30, 0]]
+    usage = _usage_file(tmp_path, counts)
+    _repack(monkeypatch, tensors, tmp_path, usage_file=usage, hot_prefix=3)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    calls = []
+    real = MmapExpertSource._read_hot_prefix
+
+    def spy(self, layer, role, nrows):
+        calls.append((layer, role, nrows))
+        return real(self, layer, role, nrows)
+
+    monkeypatch.setattr(MmapExpertSource, "_read_hot_prefix", spy)
+
+    # plan ids at hot slots {1: 0, 0: 1, 2: 2} -> permuted prefix: bounce + scatter;
+    # expert 3 sits outside the hot bank and comes from the main bank
+    source = MmapExpertSource.open(str(tmp_path), pin_plan={0: [1, 3, 0]})
+    assert calls == [(0, "gate_up", 3), (0, "down", 3)]
+    for role in ("gate_up", "down"):
+        for expert in (1, 3, 0):
+            assert torch.equal(source.warm_row(0, role, expert), source._view(0, role)[expert])
+    source.close()
+
+
+def test_pin_build_falls_back_when_the_plan_is_sparse_in_the_hot_bank(monkeypatch, tmp_path):
+    from freetoken.moe.expert_source import MmapExpertSource
+
+    E, H, I = 4, 64, 32
+    tensors = _fused_tensors(1, E, H, I)
+    counts = [[10, 40, 30, 0]]
+    usage = _usage_file(tmp_path, counts)
+    _repack(monkeypatch, tensors, tmp_path, usage_file=usage, hot_prefix=4)
+
+    called = []
+    monkeypatch.setattr(
+        MmapExpertSource, "_read_hot_prefix",
+        lambda self, layer, role, nrows: called.append((layer, role, nrows)) or (),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    # one expert at the far end of the hot bank: the covering prefix is the whole
+    # bank, which reads 4x the bytes the plan needs -> per-expert fallback
+    source = MmapExpertSource.open(str(tmp_path), pin_plan={0: [3]})
+    assert called == []
+    for role in ("gate_up", "down"):
+        assert torch.equal(source.warm_row(0, role, 3), source._view(0, role)[3])
+    source.close()
+
+
+def test_repack_rejects_a_mismatched_hot_ranking(monkeypatch, tmp_path):
+    E, H, I = 4, 64, 32
+    tensors = _fused_tensors(1, E, H, I)
+    usage = _usage_file(tmp_path, [[0] * E, [0] * E])  # 2 layers, model has 1
+    with pytest.raises(ValueError, match="counts but the model"):
+        _repack(monkeypatch, tensors, tmp_path, usage_file=usage, hot_prefix=2)
+    with pytest.raises(ValueError, match="exactly one ranking input"):
+        _repack(monkeypatch, tensors, tmp_path, hot_prefix=2)
+    warm = tmp_path / "warm.json"
+    warm.write_text(json.dumps({"5": [0]}))
+    with pytest.raises(ValueError, match="MoE layers"):
+        _repack(monkeypatch, tensors, tmp_path, warm_file=str(warm), hot_prefix=2)
+
+
+def test_experts_repack_cli_writes_hot_banks(monkeypatch, tmp_path):
+    import freetoken.experts.__main__ as experts_cli
+
+    E, H, I, L = 4, 64, 32, 2
+    tensors = _fused_tensors(L, E, H, I)
+    _patch(monkeypatch, tensors)
+    usage = _usage_file(tmp_path, [[10, 40, 30, 0], [5, 0, 0, 9]])
+    out = str(tmp_path / "store")
+    rc = experts_cli.main([
+        "repack", "model.gguf", "--out", out,
+        "--usage-file", usage, "--hot-prefix", "2",
+    ])
+    assert rc == 0
+    from freetoken.moe.expert_store import ExpertStoreIndex
+
+    index = ExpertStoreIndex.load(out)
+    assert index.location(0, "gate_up").hot_ids == (1, 2)
+    assert (tmp_path / "store" / "layer-000.gate_up.hot.bin").exists()
+

@@ -169,7 +169,9 @@ pin with `--expert-pin-fraction`; to calibrate, run `ft experts stats --model <g
     banks and prefetches each routed expert (D, see `mmap-tiering-performance.md`).
   - `ft checkpoint` does not emit an expert store, and the engine checks the store's
     format/geometry but not its `fingerprint`/`source_path`, so a same-geometry store built
-    from a different checkpoint is accepted silently.
+    from a different checkpoint is accepted silently. `ft experts repack --hot-only` does
+    verify the fingerprint before patching hot banks into a store; the engine load path
+    still does not.
 - Prefetch depth is `--expert-prefetch N` (flag > `FREETOKEN_EXPERT_PREFETCH` env > default
   4; 0 disables all prefetch - the next-layer usage plan and the staged copy's same-layer
   miss WILLNEED together). It used to be env-only with a `max(1, ...)` clamp, so 0 silently
